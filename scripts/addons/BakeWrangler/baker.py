@@ -10,6 +10,8 @@ except:
     from nodes import node_tree
     from nodes.node_tree import _print
 
+debug = False
+
 
 
 # Process the node tree with the given node as the starting point
@@ -19,13 +21,62 @@ def process_tree(tree_name, node_name):
     err = False
     
     _print("> Processing [%s]" % (node.get_name()), tag=True)
-    
+    _print(">", tag=True)
+    if debug: _print("> Debugging output enabled", tag=True)
+        
     # Decide how to process tree based on starting node type
     if node.bl_idname == 'BakeWrangler_Bake_Pass':
         # A Bake Pass node should bake all attached meshes to a single image then generate all attached outputs
         err, img_bake, img_mask = process_bake_pass_input(node)
-        err = process_bake_pass_output(node, img_bake, img_mask)
-    
+        err += process_bake_pass_output(node, img_bake, img_mask)
+        
+    elif node.bl_idname == 'BakeWrangler_Output_Image_Path':
+        # An Image Path node should bake all attached Bake Pass nodes, but only process the results for itself
+        req_passes = []
+        req_channs = 0
+        for input in node.inputs:
+            if input.is_linked and input.valid and input.links[0].is_valid:
+                link = input.links[0]
+                req_channs += 1
+                if not req_passes.count(link.from_node):
+                    req_passes.append(link.from_node)
+                    
+        _print("> Generating [%i] passes for [%i] input channels:" % (len(req_passes), req_channs), tag=True)
+        _print(">", tag=True)
+        
+        for bake_pass in req_passes:
+            _print("> [%s]" % (bake_pass.get_name()), tag=True)
+            err, img_bake, img_mask = process_bake_pass_input(bake_pass)
+            err += process_bake_pass_output(bake_pass, img_bake, img_mask, node)
+            if bake_pass != req_passes[-1]:
+                _print(">", tag=True)
+                
+    elif node.bl_idname == 'BakeWrangler_Output_Batch_Bake':
+        # Batch process node will have a number of Image Path nodes connected. Most efficient process should
+        # be to determine all required unique bake passes and perform them same as in the Bake Pass case
+        req_passes = []
+        total_imgs = []
+        for input in node.inputs:
+            if input.is_linked and input.valid and input.links[0].is_valid:
+                output_img = input.links[0].from_node
+                if not total_imgs.count(output_img):
+                    total_imgs.append(output_img)
+                for bake in output_img.inputs:
+                    if bake.is_linked and bake.valid and bake.links[0].is_valid:
+                        link = bake.links[0]
+                        if not req_passes.count(link.from_node):
+                            req_passes.append(link.from_node)
+                            
+        _print("> Generating [%i] passes for [%i] output images:" % (len(req_passes), len(total_imgs)), tag=True)
+        _print(">", tag=True)
+        
+        for bake_pass in req_passes:
+            _print("> [%s]" % (bake_pass.get_name()), tag=True)
+            err, img_bake, img_mask = process_bake_pass_input(bake_pass)
+            err += process_bake_pass_output(bake_pass, img_bake, img_mask)
+            if bake_pass != req_passes[-1]:
+                _print(">", tag=True)
+
     return err
 
 
@@ -90,7 +141,7 @@ def process_bake_pass_input(node):
     for input in inputs:
         if input.is_linked:
             link = input.links[0]
-            if link.is_valid and not meshes.count(link.from_node):
+            if link.is_valid and link.to_socket.valid and not meshes.count(link.from_node):
                 meshes.append(link.from_node)
     
     _print(">  Input Meshes: %i" % (len(meshes)), tag=True)
@@ -98,14 +149,14 @@ def process_bake_pass_input(node):
     # Generate the bake and mask images
     img_bake = bpy.data.images.new(node.get_name(), width=x_res, height=y_res)
     img_bake.alpha_mode = 'NONE'
-    img_bake.colorspace_settings.name = 'Raw'
+    img_bake.colorspace_settings.name = 'Non-Color'
+    img_bake.colorspace_settings.is_data = True
     if bake_type == 'NORMAL':
-        img_bake.colorspace_settings.is_data = True
         img_bake.generated_color = (0.5, 0.5, 1.0, 1.0)
                 
     img_mask = bpy.data.images.new("mask_" + node.get_name(), width=x_res, height=y_res)
     img_mask.alpha_mode = 'NONE'
-    img_mask.colorspace_settings.name = 'Raw'
+    img_mask.colorspace_settings.name = 'Non-Color'
     img_mask.colorspace_settings.is_data = True
     
     # Begin processing input meshes
@@ -361,8 +412,9 @@ def process_bake_pass_input(node):
 
 
 
-# Takes a bake pass node along with the generated image and mask. Processes all attached outputs.
-def process_bake_pass_output(node, bake, mask):
+# Takes a bake pass node along with the generated image and mask. Processes all attached outputs. Or if a target node is given
+# only outputs that go to that node will be processed.
+def process_bake_pass_output(node, bake, mask, target=None):
     pass_start = datetime.now()
     err = False
     
@@ -371,32 +423,36 @@ def process_bake_pass_output(node, bake, mask):
     for output in node.outputs:
         if output.is_linked:
             for link in output.links:
-                if link.is_valid:
+                if link.is_valid and link.to_socket.valid:
+                    if target and target != link.to_node:
+                        continue
                     outputs.append([output.name, link.to_node, link.to_socket.name])
-    
     _print(">", tag=True)
-    _print(">  Output Images: %i" % (len(outputs)), tag=True)
-    
+    _print(">  Output Images/Channels: %i" % (len(outputs)), tag=True)
+
     # Process all the valid outputs
     for bake_data, output_node, socket in outputs:
-        _print(">   %i/%i: [%s]" % ((outputs.index([bake_data, output_node, socket]) + 1), len(outputs), output_node.get_name()), tag=True)
+        _print(">   %i/%i: [%s]" % ((outputs.index([bake_data, output_node, socket]) + 1), len(outputs), output_node.get_name() + " {" + socket + "}"), tag=True)
         
         output_image = None
         output_size = [output_node.img_xres, output_node.img_yres]
         output_path = output_node.img_path
         output_name = output_node.img_name
         output_file = os.path.join(os.path.realpath(output_path), output_name)
+        output_fill = [output_node.inputs['R'].is_linked and output_node.inputs['R'].valid,
+                       output_node.inputs['G'].is_linked and output_node.inputs['G'].valid,
+                       output_node.inputs['B'].is_linked and output_node.inputs['B'].valid,
+                       output_node.inputs['Alpha'].is_linked and output_node.inputs['Alpha'].valid]
+        
+        # Convert bake to selected color space
+        err, bake_copy, img_scene = convert_to_color_space(bake, output_node.img_color_space, node.bake_device)
+        mask_copy = mask
         
         # See if the output exists or if a new file should be created
         if os.path.exists(output_file):
             # Open it
             _print(">   - Using existing file", tag=True)
             output_image = bpy.data.images.load(os.path.abspath(output_file))
-            
-            # The image could be a different size to what is specified. If so, scale it to match
-            if output_image.size[0] != output_size[0] or output_image.size[1] != output_size[1]:
-                _print(">   -- Resolution mis-match, scaling", tag=True)
-                output_image.scale(output_size[0], output_size[1])
         else:
             # Create it
             _print(">   - Creating file", tag=True)
@@ -406,22 +462,28 @@ def process_bake_pass_output(node, bake, mask):
                 output_image.generated_color = (0.5, 0.5, 1.0, 1.0)
         
         # Set the color space, etc
-        output_image.colorspace_settings.name = output_node.img_color_space
+        #output_image.colorspace_settings.name = output_node.img_color_space
+        output_image.colorspace_settings.name = 'Raw'
         if output_node.img_color_space == 'Non-Color':
             output_image.colorspace_settings.is_data = True
         output_image.alpha_mode = 'STRAIGHT'
         output_image.file_format = output_node.img_type
         
+        # The image could be a different size to what is specified. If so, scale it to match
+        if output_image.size[0] != output_size[0] or output_image.size[1] != output_size[1]:
+            _print(">   -- Resolution mis-match, scaling", tag=True)
+            output_image.scale(output_size[0], output_size[1])
+
+        if debug: _print(">     Loaded image: %i x %i, %i channels, %i bpp, %i px (%i values)" % (output_image.size[0], output_image.size[1], output_image.channels, output_image.depth, len(output_image.pixels) / output_image.channels, len(output_image.pixels)), tag=True)
+                
         # If the output is a different size to the bake, make a copy of the bake data and scale it to match.
         # A copy is used because multiple outputs can reference the same bake data and be different sizes, so
         # the original data needs to be preserved.
-        bake_copy = bake
-        mask_copy = mask
         if bake.size[0] != output_size[0] or bake.size[1] != output_size[1]:
             _print(">   - Bake resolution mis-match, scaling bake", tag=True)
             
-            bake_copy = bake.copy()
-            bake_copy.pixels = list(bake.pixels)
+            #bake_copy = bake.copy()
+            #bake_copy.pixels = list(bake.pixels)
             bake_copy.scale(output_size[0], output_size[1])
             
             mask_copy = mask.copy()
@@ -434,104 +496,106 @@ def process_bake_pass_output(node, bake, mask):
         mask_px = list()
         output_px = list(output_image.pixels)
         
-        # Color to Color can just be copied directly, anything else needs some intermediate steps
-        if not (bake_data == 'Color' and socket == 'Color' and not node.mask_samples > 0):
-            map_time = datetime.now()
-            _print(">   - Bake data requies mapping to output image: ", tag=True, wrap=False)
-            # Get the bake channel
+        if debug: _print(">     Baked  image: %i x %i, %i channels, %i bpp, %i px (%i values)" % (bake_copy.size[0], bake_copy.size[1], bake_copy.channels, bake_copy.depth, len(bake_copy.pixels) / bake_copy.channels, len(bake_copy.pixels)), tag=True)
+        
+        # Color to Color could just be copied directly, but so that order of bakes doesn't matter in
+        # batch mode everything will get mapped, leaving a channel empty if another pass will fill it
+        map_time = datetime.now()
+        _print(">   - Bake data mapping to output image: ", tag=True, wrap=False)
+        # Get the bake channel
+        bake_channel = 0
+        if bake_data == 'Color' or bake_data == 'Value':
+            pass
+        elif bake_data == 'R' and bake_copy.channels > 0:
             bake_channel = 0
-            if bake_data == 'Color' or bake_data == 'Value':
-                pass
-            elif bake_data == 'R' and bake_copy.channels > 0:
-                bake_channel = 0
-            elif bake_data == 'G' and bake_copy.channels > 1:
-                bake_channel = 1
-            elif bake_data == 'B' and bake_copy.channels > 2:
-                bake_channel = 2
-            else:
-                _print("Error: Bake image does not have enough channels to read '%s'" % (bake_data), tag=True)
-                err = True
-                continue
-            
-            # Get the output channel
-            output_channel = 0
-            if socket == 'Color':
-                pass
-            elif socket == 'R' and output_image.channels > 0:
-                output_channel = 0
-            elif socket == 'G' and output_image.channels > 1:
-                output_channel = 1
-            elif socket == 'B' and output_image.channels > 2:
-                output_channel = 2
-            elif socket == 'Alpha' and output_image.channels > 3:
-                output_channel = 3
-            else:
-                _print("Error: Output image does not have enough channels to write '%s'" % (socket), tag=True)
-                err = True
-                continue
-            
-            bake_use_mask = False
-            if node.mask_samples > 0:
-                mask_px = list(mask_copy.pixels)
-                bake_use_mask = True
-            
-            # The bake will be an RGB image, but most outputs don't use all of the channels. Iterate over all
-            # the pixels and map the correct bake data to the correct output channel.
-            for pix in range(output_size[0] * output_size[1]):
-                # Pixels are 'channels' values long
-                bake_index = pix * bake_copy.channels
-                out_index = pix * output_image.channels
-                
-                # What data should be mapped?
-                if bake_use_mask and not mask_px[bake_index]:
-                    continue
-                    
-                elif bake_data == 'Color':
-                    if socket == 'Color':
-                        for chan in range(bake_copy.channels):
-                            if output_image.channels > chan:
-                                output_px[out_index + chan] = bake_px[bake_index + chan]
-                    else:
-                        # Its not entirely clear how a color should be mapped to a single channel, so the output
-                        # channel will get the relevent channel from the color, as that seems the most useful.
-                        if bake_copy.channels >= output_image.channels:
-                            output_px[out_index + output_channel] = bake_px[bake_index + output_channel]
-                        # Fall back to just using the first value
-                        else:
-                            output_px[out_index + output_channel] = bake_px[bake_index]
-                        
-                # Value should be the highest value channel, excluding alpha
-                elif bake_data == 'Value':
-                    val = 0
-                    for chan in range(bake_copy.channels - 1):
-                        if bake_px[bake_index + chan] > val:
-                            val = bake_px[bake_index + chan]
-                            
-                    output_px[out_index + output_channel] = val
-                
-                # Anything else is a simple channel to other channel mapping, unless its to the color input
-                else:
-                    # If a single value is mapped to color, try putting it in the same channel it came from
-                    if socket == 'Color':
-                        if output_image.channels >= bake_copy.channels:
-                            output_px[out_index + bake_channel] = bake_px[bake_index + bake_channel]
-                        # Fall back to puttint it in the first channel
-                        else:
-                            output_px[out_index] = bake_px[bake_index + bake_channel]
-                            
-                    else:
-                        output_px[out_index + output_channel] = bake_px[bake_index + bake_channel]
-                    
-            _print("Done in %s" % (str(datetime.now() - map_time)), tag=True)
+        elif bake_data == 'G' and bake_copy.channels > 1:
+            bake_channel = 1
+        elif bake_data == 'B' and bake_copy.channels > 2:
+            bake_channel = 2
         else:
-            output_px = bake_px
+            _print("Error: Bake image does not have enough channels to read '%s'" % (bake_data), tag=True)
+            err = True
+            continue
+        
+        # Get the output channel
+        output_channel = 0
+        if socket == 'Color':
+            pass
+        elif socket == 'R' and output_image.channels > 0:
+            output_channel = 0
+        elif socket == 'G' and output_image.channels > 1:
+            output_channel = 1
+        elif socket == 'B' and output_image.channels > 2:
+            output_channel = 2
+        elif socket == 'Alpha' and output_image.channels > 3:
+            output_channel = 3
+        else:
+            _print("Error: Output image does not have enough channels to write '%s'" % (socket), tag=True)
+            err = True
+            continue
+        
+        bake_use_mask = False
+        if node.mask_samples > 0:
+            mask_px = list(mask_copy.pixels)
+            bake_use_mask = True
+        
+        # The bake will be an RGB image, but most outputs don't use all of the channels. Iterate over all
+        # the pixels and map the correct bake data to the correct output channel.
+        for pix in range(output_size[0] * output_size[1]):
+            # Pixels are 'channels' values long
+            bake_index = pix * bake_copy.channels
+            out_index = pix * output_image.channels
             
+            # What data should be mapped?
+            if bake_use_mask and not mask_px[bake_index]:
+                continue
+                
+            elif bake_data == 'Color':
+                if socket == 'Color':
+                    for chan in range(bake_copy.channels):
+                        if output_image.channels > chan and not output_fill[chan]:
+                            output_px[out_index + chan] = bake_px[bake_index + chan]
+                else:
+                    # Its not entirely clear how a color should be mapped to a single channel, so the output
+                    # channel will get the relevent channel from the color, as that seems the most useful.
+                    if bake_copy.channels >= output_image.channels:
+                        output_px[out_index + output_channel] = bake_px[bake_index + output_channel]
+                    # Fall back to just using the first value
+                    else:
+                        output_px[out_index + output_channel] = bake_px[bake_index]
+                    
+            # Value should be the highest value channel, excluding alpha
+            elif bake_data == 'Value':
+                val = 0
+                for chan in range(bake_copy.channels - 1):
+                    if bake_px[bake_index + chan] > val:
+                        val = bake_px[bake_index + chan]
+                        
+                output_px[out_index + output_channel] = val
+            
+            # Anything else is a simple channel to other channel mapping, unless its to the color input
+            else:
+                # If a single value is mapped to color, try putting it in the same channel it came from
+                if socket == 'Color':
+                    if output_image.channels >= bake_copy.channels:
+                        output_px[out_index + bake_channel] = bake_px[bake_index + bake_channel]
+                    # Fall back to puttint it in the first channel
+                    else:
+                        output_px[out_index] = bake_px[bake_index + bake_channel]
+                        
+                else:
+                    output_px[out_index + output_channel] = bake_px[bake_index + bake_channel]
+                
+        _print("Done in %s" % (str(datetime.now() - map_time)), tag=True)
+        
+        if debug: _print(">     Will try to write %i values to space for %i" % (len(output_px), len(output_image.pixels)), tag=True)   
+        
         # Copy the pixels to the image and save it
         _print(">   - Writing pixels and saving image: ", tag=True, wrap=False)
         output_image.pixels[0:] = output_px
         
         # Configure output image settings
-        img_scene = bpy.context.window.scene
+        #img_scene = bpy.context.window.scene
         img_settings = img_scene.render.image_settings
         img_settings.file_format = output_node.img_type
         
@@ -586,6 +650,80 @@ def process_bake_pass_output(node, bake, mask):
     
     return err
 
+
+
+# Takes a bake and converts it to the target color space by projecting it to an emission plane and baking to
+# a new image with the specified color space set. Returns [err, the new image, template scene].
+def convert_to_color_space(bake, color_space, device):
+    err = False 
+    # Create new file to be color spaced version of the bake
+    img_conv = bpy.data.images.new(bake.name + "_" + color_space, width=bake.size[0], height=bake.size[1])
+    img_conv.alpha_mode = 'NONE'
+    img_conv.colorspace_settings.name = color_space
+    if color_space == 'Non-Color':
+        img_conv.colorspace_settings.is_data = True
+    
+    # Load up the template scene
+    bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
+    bake_scene = None
+    with bpy.data.libraries.load(bake_scene_path, link=False, relative=False) as (file_from, file_to):
+        file_to.scenes.append("BakeWrangler")
+    bake_scene = file_to.scenes[0]
+    # Set the cycles values that aren't saved in the template and give it a name that can be traced
+    bake_scene.cycles.device = device
+    bake_scene.cycles.samples = 12
+    bake_scene.cycles.aa_samples = 12
+    bake_scene.name = "convert_" + bake.name + "_" + color_space
+    
+    # Switch into bake scene
+    prev_scene = bpy.context.window.scene
+    prev_layer = bpy.context.view_layer
+    bpy.context.window.scene = bake_scene
+    # Trick to make the view layer stay the same on switching back maybe?
+    bpy.context.view_layer.name = prev_layer.name
+    
+    # Now create a new plane, stick an emission material on it with the bake and do a new bake
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.ops.mesh.primitive_plane_add()
+    plane = bpy.context.active_object
+    plane.name = "plane_" + bake.name + "_" + color_space
+    
+    # Set up the material then add it to the plane
+    mat = bpy.data.materials.new(name="mat_convert_" + bake.name + "_" + color_space)
+    mat.use_nodes = True
+    mat.node_tree.nodes.clear()
+    img_src = mat.node_tree.nodes.new('ShaderNodeTexImage')
+    img_src.image = bake
+    img_src.select = False
+    emit = mat.node_tree.nodes.new('ShaderNodeEmission')
+    mat.node_tree.links.new(img_src.outputs['Color'], emit.inputs['Color'])
+    outp = mat.node_tree.nodes.new('ShaderNodeOutputMaterial')
+    outp.target = 'CYCLES'
+    mat.node_tree.links.new(emit.outputs['Emission'], outp.inputs['Surface'])
+    img_dst = mat.node_tree.nodes.new('ShaderNodeTexImage')
+    img_dst.image = img_conv
+    img_dst.select = True
+    mat.node_tree.nodes.active = img_dst
+    
+    plane.data.materials.append(mat)
+    
+    # Try the bake
+    try:
+        bpy.ops.object.bake(
+            type='EMIT',
+            margin=0,
+            save_mode='INTERNAL',
+            use_clear=True,
+            )
+    except RuntimeError as error:
+        _print("%s" % (error), tag=True)
+        err = True
+        
+    # Switch back to main scene before next pass. Nothing will be deleted so that the file can be examined for debugging.
+    bpy.context.window.scene = prev_scene
+    
+    return [err, img_conv, bake_scene]
+    
 
 
 # Takes a materials node tree and makes any changes necessary to perform the given bake type. A material must
@@ -732,7 +870,7 @@ def main():
         return
 
     if not args.tree or not args.node:
-        print("Error: required arguments not found")
+        print("Error: Bake Wrangler baker required arguments not found")
         return
     
     # Make sure the node classes are registered
@@ -742,7 +880,16 @@ def main():
         print("Info: Bake Wrangler nodes already registered")
     else:
         print("Info: Bake Wrangler nodes registered")
-        
+    
+    # Try to load preferences
+    try:
+        prefs = bpy.context.preferences.addons[os.path.basename(os.path.dirname(__file__))].preferences
+    except:
+        print("Info: Bake Wrangler couldn't load preferences, using defaults")
+    else:
+        print("Info: Bake Wrangler preferences loaded")
+        debug = prefs['debug']
+    
     # Start processing bakery node tree
     err = process_tree(args.tree, args.node)
     

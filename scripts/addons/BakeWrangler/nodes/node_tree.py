@@ -85,7 +85,7 @@ class BakeWrangler_Operator_BakeStop(BakeWrangler_Operator, bpy.types.Operator):
     
 # Operator for bake pass node
 class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
-    '''Perform the bake pass and generate all connected image outputs'''
+    '''Perform requested bake action(s)'''
     bl_idname = "bake_wrangler_op.bake_pass"
     bl_label = "Bake Pass"
 
@@ -292,7 +292,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         node = tree.nodes[self.node]
         tree.baking = self
         tree.interface_update(context)
-        self.valid = node.validate()
+        self.valid = node.validate(is_primary=True)
         
         # Check processing script exists
         bake_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -353,20 +353,6 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             layout.label(text="See console for progress information and warnings")
 
 
-class BakeWrangler_Operator_BakeImage(BakeWrangler_Operator, bpy.types.Operator):
-    '''Perform the connected bake pass or passes and generate just the single image output'''
-    bl_idname = "bake_wrangler_op.bake_image"
-    bl_label = "Bake Image"
-
-    def execute(self, context):
-        pass
-    
-    @classmethod
-    def poll(type, context):
-        # Not yet implemented
-        return False
-    
-
 
 #
 # Bake Wrangler nodes system
@@ -380,7 +366,7 @@ class BakeWrangler_Tree(NodeTree):
     
     # Does this need a lock for modal event access?
     baking = None
-
+        
 
 # Custom Sockets:
 
@@ -405,24 +391,52 @@ class BakeWrangler_Tree_Socket:
 # Socket for sharing high poly mesh, or really any mesh data that should be in the bake but isn't the target
 class BakeWrangler_Socket_HighPolyMesh(NodeSocket, BakeWrangler_Tree_Socket):
     '''Socket for connecting a high poly mesh node'''
-    bl_label = 'High Poly'
+    bl_label = 'Bake From'
     
     # Called to filter objects listed in the value search field. Only objects of type 'MESH' are shown.
     def value_prop_filter(self, object):
-        return object.type == 'MESH'
+        if self.collection:
+            return len(object.all_objects)
+        else:
+            return object.type in ['MESH', 'CURVE']
     
-    # Called when the value propery changes.
+    # Called when the value property changes.
     def value_prop_update(self, context):
         if self.node and self.node.bl_idname == 'BakeWrangler_Input_HighPolyMesh':
             self.node.update_inputs()
+    
+    # Called when the collection property changes
+    def collection_prop_update(self, context):
+        if self.collection == False and self.value:
+            self.value = None
         
-    value: bpy.props.PointerProperty(name="High Poly Mesh", description="Object to be part of selection when doing a selected to active type bake.", type=bpy.types.Object, poll=value_prop_filter, update=value_prop_update)
+    value: bpy.props.PointerProperty(name="Bake From Object(s)", description="Geometry to be part of selection when doing a 'selected to active' type bake", type=bpy.types.ID, poll=value_prop_filter, update=value_prop_update)
+    collection: bpy.props.BoolProperty(name="Collection", description="When enabled whole collections will be selected instead of individual objects", update=collection_prop_update, default=False)
+    recursive: bpy.props.BoolProperty(name="Recursive Selection", description="When enabled all collections within the selected collection will be used", default=False)
     
     def draw(self, context, layout, node, text):
         if node.bl_idname == 'BakeWrangler_Input_Mesh' and node.multi_res:
             layout.label(text=text + " [ignored]")
         elif not self.is_output and not self.is_linked and node.bl_idname != 'BakeWrangler_Input_Mesh':
-            layout.prop_search(self, "value", context.scene, "objects", text="")
+            row = layout.row()
+            if self.collection:
+                if self.value:
+                    row.prop_search(self, "value", context.scene.collection, "children", text="", icon='GROUP')
+                else:
+                    row.prop(self, "collection", icon='GROUP', text="")
+                    row.prop_search(self, "value", context.scene.collection, "children", text="", icon='NONE')
+                row.prop(self, "recursive", icon='OUTLINER', text="")
+            else:
+                ico = 'NONE'
+                if self.value:
+                    obj = bpy.types.Object(self.value)
+                    if  obj.type == 'MESH':
+                        ico = 'MESH_DATA'
+                    elif obj.type == 'CURVE':
+                        ico = 'CURVE_DATA'
+                else:
+                    row.prop(self, "collection", icon='GROUP', text="")
+                row.prop_search(self, "value", context.scene, "objects", text="", icon=ico)
         else:
             layout.label(text=BakeWrangler_Tree_Socket.socket_label(self, text))
 
@@ -440,18 +454,6 @@ class BakeWrangler_Socket_Mesh(NodeSocket, BakeWrangler_Tree_Socket):
 
     def draw_color(self, context, node):
         return BakeWrangler_Tree_Socket.socket_color(self, (0.0, 0.5, 1.0, 1.0))
-    
-
-# Socket for connecting a bake pass up to a batch controller (oven)
-class BakeWrangler_Socket_Pass(NodeSocket, BakeWrangler_Tree_Socket):
-    '''Socket for connecting a bake pass node'''
-    bl_label = 'Pass'
-    
-    def draw(self, context, layout, node, text):
-        layout.label(text=BakeWrangler_Tree_Socket.socket_label(self, text))
-
-    def draw_color(self, context, node):
-        return BakeWrangler_Tree_Socket.socket_color(self, (1.0, 0.5, 1.0, 1.0))
     
     
 # Socket for RGB(A) data, extends the base color node
@@ -476,6 +478,18 @@ class BakeWrangler_Socket_Float(NodeSocketFloat, BakeWrangler_Tree_Socket):
     
     def draw_color(self, context, node):
         return BakeWrangler_Tree_Socket.socket_color(self, (0.631, 0.631, 0.631, 1.0))
+
+
+# Socket for connecting an output image to a batch job node
+class BakeWrangler_Socket_Bake(NodeSocket, BakeWrangler_Tree_Socket):
+    '''Socket for connecting an output image node to a batch node'''
+    bl_label = 'Bake'
+    
+    def draw(self, context, layout, node, text):
+        layout.label(text=BakeWrangler_Tree_Socket.socket_label(self, text))
+
+    def draw_color(self, context, node):
+        return BakeWrangler_Tree_Socket.socket_color(self, (1.0, 0.5, 1.0, 1.0))
     
 
 # Custom Nodes:
@@ -494,26 +508,62 @@ class BakeWrangler_Tree_Node:
     
     def validate(self):
         return [True]
-
-
-# Input node that takes any number of mesh objects that should be selected durning a bake
-class BakeWrangler_Input_HighPolyMesh(Node, BakeWrangler_Tree_Node):
-    '''High poly mesh data node'''
-    bl_label = 'High Poly Meshs'
-    
+        
     # Makes sure there is always one empty input socket at the bottom by adding and removing sockets
-    # when their values.
-    def update_inputs(self):
+    def update_inputs(self, socket_type, socket_name):
         idx = 0
         for socket in self.inputs:
-            if socket.value or socket.is_linked:
+            if socket.is_linked or (hasattr(socket, 'value') and socket.value):
                 if len(self.inputs) == idx + 1:
-                    self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "High Poly")
+                    self.inputs.new(socket_type, socket_name)
             else:
                 if len(self.inputs) > idx + 1:
                     self.inputs.remove(socket)
                     idx = idx - 1
             idx = idx + 1
+    
+    # Update inputs and links on updates
+    def update(self):
+        self.update_inputs()
+        # Links can get inserted without calling insert_link, but update is called.
+        for socket in self.inputs:
+            if socket.is_linked and not socket.valid:
+                self.insert_link(socket.links[0])
+    
+    # Validate incoming links
+    def insert_link(self, link):
+        if link.to_node == self:
+            if link.from_socket.bl_idname == link.to_socket.bl_idname:
+                link.to_socket.valid = True
+            else:
+                link.to_socket.valid = False
+                
+    # Draw bake button in correct state
+    def draw_bake_button(self, layout, icon, label):
+        if self.id_data.baking != None:
+            if self.id_data.baking.node == self.name:
+                if self.id_data.baking.stop(kill=False):
+                    layout.operator("bake_wrangler_op.dummy", icon='CANCEL', text="Stopping...")
+                else:
+                    op = layout.operator("bake_wrangler_op.bake_stop", icon='CANCEL')
+                    op.tree = self.id_data.name
+                    op.node = self.name
+            else:
+                layout.operator("bake_wrangler_op.dummy", icon=icon, text=label)
+        else:
+            op = layout.operator("bake_wrangler_op.bake_pass", icon=icon, text=label)
+            op.tree = self.id_data.name
+            op.node = self.name
+
+
+# Input node that takes any number of objects that should be selected durning a bake
+class BakeWrangler_Input_HighPolyMesh(Node, BakeWrangler_Tree_Node):
+    '''High poly mesh data node'''
+    bl_label = 'Bake From'
+    
+    # Makes sure there is always one empty input socket at the bottom by adding and removing sockets
+    def update_inputs(self):
+        BakeWrangler_Tree_Node.update_inputs(self, 'BakeWrangler_Socket_HighPolyMesh', "Bake From")
     
     # Returns a list of all chosen mesh objects. May recurse through multiple connected nodes.
     def get_objects(self):
@@ -521,7 +571,17 @@ class BakeWrangler_Input_HighPolyMesh(Node, BakeWrangler_Tree_Node):
         for input in self.inputs:
             if not input.is_linked:
                 if input.value:
-                    objects.append(input.value)
+                    if input.collection:
+                        col_objects = []
+                        if input.recursive:
+                            col_objects = input.value.all_objects
+                        else:
+                            col_objects = input.value.objects
+                        visible_objects = [ob for ob in col_objects if ob.type in ['MESH', 'CURVE']]
+                        for ob in visible_objects:
+                            objects.append(ob)
+                    else:
+                        objects.append(input.value)
             else:
                 linked_objects = []
                 if input.links[0].is_valid and input.valid:
@@ -532,23 +592,12 @@ class BakeWrangler_Input_HighPolyMesh(Node, BakeWrangler_Tree_Node):
     
     def init(self, context):
         # Sockets IN
-        self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "High Poly")
+        self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "Bake From")
         # Sockets OUT
-        self.outputs.new('BakeWrangler_Socket_HighPolyMesh', "High Poly")
+        self.outputs.new('BakeWrangler_Socket_HighPolyMesh', "Bake From")
   
     def draw_buttons(self, context, layout):
-        layout.label(text="Meshs:")
-
-    def update(self):
-        self.update_inputs()
-    
-    # Validate incoming links
-    def insert_link(self, link):
-        if link.to_node == self:
-            if link.from_socket.bl_idname == link.to_socket.bl_idname:
-                link.to_socket.valid = True
-            else:
-                link.to_socket.valid = False
+        layout.label(text="Objects:")
 
 
 # Input node that takes a single target mesh and its bake settings. High poly mesh nodes can be added as input.
@@ -562,6 +611,9 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
         if self.mesh_object:
             name += " (%s)" % (self.mesh_object.name)
         return name
+        
+    def update_inputs(self):
+        pass
     
     # Check node settings are valid to bake. Returns true/false, plus error message.
     def validate(self, check_materials=False):
@@ -689,7 +741,7 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
     
     def init(self, context):
         # Sockets IN
-        self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "High Polys")
+        self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "Bake From")
         # Sockets OUT
         self.outputs.new('BakeWrangler_Socket_Mesh', "Mesh")
 
@@ -709,20 +761,6 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
             layout.prop(self, "ray_dist", text="Ray Dist")
         else:
             layout.prop(self, "multi_res_pass")
-    
-    def update(self):
-        # Links can get inserted without calling insert_link, but update is called.
-        for socket in self.inputs:
-            if socket.is_linked and not socket.valid:
-                self.insert_link(socket.links[0])
-            
-    # Validate incoming links
-    def insert_link(self, link):
-        if link.to_node == self:
-            if link.from_socket.bl_idname == link.to_socket.bl_idname:
-                link.to_socket.valid = True
-            else:
-                link.to_socket.valid = False
         
 
 # Baking node that holds all the settings for a type of bake 'pass'. Takes one or more mesh input nodes as input.
@@ -737,8 +775,12 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
             name += " (%s)" % (self.bake_pass)
         return name
     
+    # Makes sure there is always one empty input socket at the bottom by adding and removing sockets
+    def update_inputs(self):
+        BakeWrangler_Tree_Node.update_inputs(self, 'BakeWrangler_Socket_Mesh', "Mesh")
+        
     # Check node settings are valid to bake. Returns true/false, plus error message(s).
-    def validate(self):
+    def validate(self, is_primary=False):
         valid = [True]
         # Validate inputs
         has_valid_input = False
@@ -760,38 +802,25 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
             valid[0] = False
             valid.append(_print("Has no valid inputs connected", node=self, ret=True))
         # Validate outputs
-        has_valid_output = False
-        for output in self.outputs:
-            if output.is_linked:
-                for link in output.links:
-                    if link.is_valid and link.to_socket.valid:
-                        output_valid = link.to_node.validate()
-                        if not output_valid[0]:
-                            valid[0] = output_valid.pop(0)
-                            valid += output_valid
-                        else:
-                            output_valid.pop(0)
-                            valid += output_valid
-                            has_valid_output = True
-        if not has_valid_output and errs == len(valid):
-            valid[0] = False
-            valid.append(_print("Has no valid outputs connected", node=self, ret=True))
+        if is_primary:
+            has_valid_output = False
+            for output in self.outputs:
+                if output.is_linked:
+                    for link in output.links:
+                        if link.is_valid and link.to_socket.valid:
+                            output_valid = link.to_node.validate()
+                            if not output_valid[0]:
+                                valid[0] = output_valid.pop(0)
+                                valid += output_valid
+                            else:
+                                output_valid.pop(0)
+                                valid += output_valid
+                                has_valid_output = True
+            if not has_valid_output and errs == len(valid):
+                valid[0] = False
+                valid.append(_print("Has no valid outputs connected", node=self, ret=True))
         # Validated
         return valid
-    
-    # Makes sure there is always one empty input socket at the bottom by adding and removing sockets
-    # as required
-    def update_inputs(self):
-        idx = 0
-        for socket in self.inputs:
-            if socket.is_linked:
-                if len(self.inputs) == idx + 1:
-                    self.inputs.new('BakeWrangler_Socket_Mesh', "Mesh")
-            else:
-                if len(self.inputs) > idx + 1:
-                    self.inputs.remove(socket)
-                    idx = idx - 1
-            idx = idx + 1
     
     bake_passes = (
         ('ALBEDO', "Albedo", "Surface color without lighting (Principled shader only)"),
@@ -866,20 +895,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         self.outputs.new('BakeWrangler_Socket_Float', "Value")
 
     def draw_buttons(self, context, layout):
-        if self.id_data.baking != None:
-            if self.id_data.baking.node == self.name:
-                if self.id_data.baking.stop(kill=False):
-                    layout.operator("bake_wrangler_op.dummy", icon='CANCEL', text="Stopping...")
-                else:
-                    op = layout.operator("bake_wrangler_op.bake_stop", icon='CANCEL')
-                    op.tree = self.id_data.name
-                    op.node = self.name
-            else:
-                layout.operator("bake_wrangler_op.dummy", icon='RENDER_STILL', text="Bake Pass")
-        else:
-            op = layout.operator("bake_wrangler_op.bake_pass", icon='RENDER_STILL')
-            op.tree = self.id_data.name
-            op.node = self.name
+        BakeWrangler_Tree_Node.draw_bake_button(self, layout, 'RENDER_STILL', "Bake Pass")
         layout.prop(self, "bake_pass")
         if self.bake_pass == 'NORMAL':
             split = layout.split(factor=0.5)
@@ -924,21 +940,6 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         split = layout.split(factor=0.15)
         split.label(text="Y:")
         split.prop(self, "bake_yres", text="")
-    
-    def update(self):
-        self.update_inputs()
-        # Links can get inserted without calling insert_link, but update is called.
-        for socket in self.inputs:
-            if socket.is_linked and not socket.valid:
-                self.insert_link(socket.links[0])
-    
-    # Validate incoming links
-    def insert_link(self, link):
-        if link.to_node == self:
-            if link.from_socket.bl_idname == link.to_socket.bl_idname:
-                link.to_socket.valid = True
-            else:
-                link.to_socket.valid = False
 
 
 # Output node that specifies the path to a file where a bake should be saved along with size and format information.
@@ -955,17 +956,28 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         if self.img_name:
             name += " (%s)" % (self.img_name)
         return name
+        
+    def update_inputs(self):
+        pass
     
     # Check node settings are valid to bake. Returns true/false, plus error message(s).
-    def validate(self):
+    def validate(self, is_primary=False):
         valid = [True]
         # Validate inputs
         has_valid_input = False
         for input in self.inputs:
             if input.is_linked and input.links[0].is_valid and input.valid:
-                has_valid_input = True
-                break
-        if not has_valid_input:
+                if not is_primary:
+                    has_valid_input = True
+                    break
+                else:
+                    input_valid = input.links[0].from_node.validate()
+                    valid[0] = input_valid.pop(0)
+                    if valid[0]:
+                        has_valid_input = True
+                    valid += input_valid    
+        errs = len(valid)
+        if not has_valid_input and errs < 2:
             valid[0] = False
             valid.append(_print("Has no valid inputs connected", node=self, ret=True))
         # Validate file path
@@ -1164,11 +1176,12 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     def init(self, context):
         # Sockets IN
         self.inputs.new('BakeWrangler_Socket_Color', "Color")
-        # Sockets OUT
         self.inputs.new('BakeWrangler_Socket_Float', "Alpha")
         self.inputs.new('BakeWrangler_Socket_Float', "R")
         self.inputs.new('BakeWrangler_Socket_Float', "G")
         self.inputs.new('BakeWrangler_Socket_Float', "B")
+        # Sockets OUT
+        self.outputs.new('BakeWrangler_Socket_Bake', "Bake")
         
         # Set initial output format to what ever is currently selected in the render settings (if it's in the list)
         for type, name, desc in self.img_format:
@@ -1181,13 +1194,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
                 break
 
     def draw_buttons(self, context, layout):
-        #layout.template_ID(self, "image", new="image.new", open="image.open")
-        if self.id_data.baking != None:
-            layout.operator("bake_wrangler_op.dummy", icon='RENDER_STILL', text="Bake Image")
-        else:
-            op = layout.operator("bake_wrangler_op.bake_image", icon='IMAGE')
-            op.tree = self.id_data.name
-            op.node = self.name
+        BakeWrangler_Tree_Node.draw_bake_button(self, layout, 'IMAGE', "Bake Image")
         layout.label(text="Image Path:")
         layout.prop(self, "img_path", text="")
         layout.prop(self, "img_name", text="")
@@ -1262,13 +1269,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             layout.prop(self, "img_dpx_log")
         if self.img_type == 'OPEN_EXR':
             layout.prop(self, "img_openexr_zbuff")
-    
-    def update(self):
-        # Links can get inserted without calling insert_link, but update is called.
-        for socket in self.inputs:
-            if socket.is_linked and not socket.valid:
-                self.insert_link(socket.links[0])
-                
+          
     # Validate incoming links
     def insert_link(self, link):
         if link.to_node == self:
@@ -1279,20 +1280,56 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         
 
 # Output controller node provides batch execution of multiple conntected bake passes. 
-class BakeWrangler_Output_Oven(Node, BakeWrangler_Tree_Node):
+class BakeWrangler_Output_Batch_Bake(Node, BakeWrangler_Tree_Node):
     '''Output controller oven node'''
-    bl_label = 'Oven'
-    
-    # Returns the most identifing string for the node
-    def get_name(self):
-        name = BakeWrangler_Tree_Node.get_name()
-        return name
+    bl_label = 'Batch Bake'
+        
+    # Makes sure there is always one empty input socket at the bottom by adding and removing sockets
+    def update_inputs(self):
+        BakeWrangler_Tree_Node.update_inputs(self, 'BakeWrangler_Socket_Bake', "Bake")
+        
+    # Check node settings are valid to bake. Returns true/false, plus error message(s).
+    def validate(self, is_primary=True):
+        valid = [True]
+        # Batch mode needs to avoid validating the same things more than once. Collect a
+        # unique list of the passes before validating them.
+        img_node_list = []
+        pass_node_list = []
+        for input in self.inputs:
+            if input.is_linked and input.links[0].is_valid and input.valid:
+                img_node = input.links[0].from_node
+                if not img_node_list.count(img_node):
+                    img_node_list.append(img_node)
+                    for img_node_input in img_node.inputs:
+                        if img_node_input.is_linked and img_node_input.links[0].is_valid and img_node_input.valid:
+                            pass_node = img_node_input.links[0].from_node
+                            if not pass_node_list.count(pass_node):
+                                pass_node_list.append(pass_node)
+        # Validate all the listed nodes
+        has_valid_input = False
+        for node in img_node_list:
+            img_node_valid = node.validate()
+            valid[0] = img_node_valid.pop(0)
+            if valid[0]:
+                has_valid_input = True
+            valid += img_node_valid
+        for node in pass_node_list:
+            pass_node_valid = node.validate()
+            valid[0] = pass_node_valid.pop(0)
+            valid += pass_node_valid
+        errs = len(valid)
+        if not has_valid_input and errs < 2:
+            valid[0] = False
+            valid.append(_print("Has no valid inputs connected", node=self, ret=True))
+        # Everything validated
+        return valid
 
     def init(self, context):
-        self.inputs.new('BakeWrangler_Socket_Recipe', "Recipe")
+        self.inputs.new('BakeWrangler_Socket_Bake', "Bake")
 
     def draw_buttons(self, context, layout):
-        layout.label(text="add recipe button")
+        BakeWrangler_Tree_Node.draw_bake_button(self, layout, 'OUTLINER', "Bake All")
+        layout.label(text="Bake Images:")
         
 
 
@@ -1320,7 +1357,7 @@ BakeWrangler_Node_Categories = [
     ]),
     BakeWrangler_Node_Category('Outputs', "Outputs", items=[
         NodeItem("BakeWrangler_Output_Image_Path"),
-        NodeItem("BakeWrangler_Output_Oven"),
+        NodeItem("BakeWrangler_Output_Batch_Bake"),
     ]),
 ]
 
@@ -1335,20 +1372,30 @@ classes = (
     BakeWrangler_Operator_Dummy,
     BakeWrangler_Operator_BakeStop,
     BakeWrangler_Operator_BakePass,
-    BakeWrangler_Operator_BakeImage,
     BakeWrangler_Tree,
     BakeWrangler_Socket_HighPolyMesh,
     BakeWrangler_Socket_Mesh,
-    BakeWrangler_Socket_Pass,
     BakeWrangler_Socket_Color,
     BakeWrangler_Socket_Float,
+    BakeWrangler_Socket_Bake,
     BakeWrangler_Input_HighPolyMesh,
     BakeWrangler_Input_Mesh,
     BakeWrangler_Bake_Pass,
     BakeWrangler_Output_Image_Path,
-    BakeWrangler_Output_Oven,
+    BakeWrangler_Output_Batch_Bake,
 )
 
+
+# Use a handler on depsgraph update to detect creation of new trees and switching to
+# the bake tree edititor - Because I can't really see a better way to get the desired
+# behaviour: New trees need a dummy user so they don't get deleted, new trees should
+# get a better name than 'node tree' and switching to the editor should load the last
+# active tree up instead of nothing.
+from bpy.app.handlers import persistent
+@persistent
+def test_handler(dummy):
+    print("Test Hanlder:", bpy.context)
+    
 
 def register():
     from bpy.utils import register_class
@@ -1356,9 +1403,11 @@ def register():
         register_class(cls)
 
     nodeitems_utils.register_node_categories('BakeWrangler_Nodes', BakeWrangler_Node_Categories)
+    #bpy.app.handlers.depsgraph_update_post.append(test_handler)
 
 
 def unregister():
+    #bpy.app.handlers.depsgraph_update_post.remove(test_handler)
     nodeitems_utils.unregister_node_categories('BakeWrangler_Nodes')
 
     from bpy.utils import unregister_class
