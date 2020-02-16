@@ -180,6 +180,10 @@ def process_bake_pass_input(node):
             cage_cpy = cage_obj.copy()
             cage_cpy.data = cage_obj.data.copy()
             cage_obj_name = cage_cpy.name
+        if len(target.data.uv_layers) > 1 and mesh.uv_map:
+            uv_name = mesh.uv_map
+        else:
+            uv_name = None
         
         # Load in template bake scene with mostly optimised settings for baking
         bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
@@ -205,6 +209,10 @@ def process_bake_pass_input(node):
         target_cpy = target.copy()
         target_cpy.data = target.data.copy()
         bake_scene.collection.objects.link(target_cpy)
+        
+        # Set UV map to use if one was selected
+        if uv_name:
+            target_cpy.data.uv_layers.active = target_cpy.data.uv_layers[uv_name]
         
         # Determine what strategy to use for this bake and set up the data for it
         bake_strategy = ''
@@ -888,7 +896,8 @@ def main():
         print("Info: Bake Wrangler couldn't load preferences, using defaults")
     else:
         print("Info: Bake Wrangler preferences loaded")
-        debug = prefs['debug']
+        if hasattr(prefs, 'debug'):
+            debug = prefs['debug']
     
     # Start processing bakery node tree
     err = process_tree(args.tree, args.node)
