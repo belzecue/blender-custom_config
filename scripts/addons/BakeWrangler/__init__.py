@@ -19,7 +19,7 @@ bl_info = {
     'name': 'Bake Wrangler',
     'description': 'Bake Wrangler aims to improve all baking tasks with a node based interface and provide some additional common bake passes',
     'author': 'Dancing Fortune Software',
-    'version': (0, 9, 0),
+    'version': (0, 9, 1),
     'blender': (2, 80, 0),
     'location': 'Editor Type -> Bake Node Editor',
     'wiki_url': '',

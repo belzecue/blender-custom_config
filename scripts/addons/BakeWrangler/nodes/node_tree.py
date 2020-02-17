@@ -103,6 +103,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
     blend_copy = None
     blend_log = None
     bake_proc = None
+    was_dirty = False
     
     # Stop this bake if it's currently running
     def stop(self, kill=True):
@@ -115,6 +116,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
     def thread(self, node_name, tree_name, file_name, exec_name, script_name):
         tree = bpy.data.node_groups[self.tree]
         node = tree.nodes[self.node]
+             
         _print("Launching background process:", node=node)
         _print("================================================================================")
         sub = subprocess.Popen([
@@ -190,6 +192,11 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         
         # Check if the bake thread has ended every timer event
         if event.type == 'TIMER':
+            # Reapply dirt by pushing something to undo stack (not ideal)
+            if self.was_dirty and not bpy.data.is_dirty:
+                bpy.ops.node.select_all(action='INVERT')
+                bpy.ops.node.select_all(True, action='INVERT')
+                self.was_dirty = False
             if not self._thread.is_alive():
                 self.cancel(context)
                 if self._kill:
@@ -245,8 +252,12 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         _print("=== Bake starts ===", node=node)
         _print("Creating temporary files in %s" % (blend_temp), node=node)
         
+        # Maintain dirt
+        if bpy.data.is_dirty:
+            self.was_dirty = True
+            
         bpy.ops.wm.save_as_mainfile(filepath=blend_copy, copy=True)
-        
+             
         # Check copy exists
         if not os.path.exists(blend_copy):
             self.report({'ERROR'}, "Blend file copy failed")
@@ -283,6 +294,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         wm.modal_handler_add(self)
         
         self._thread.start()
+             
         return {'RUNNING_MODAL'}
     
     # Called by UI when the button is clicked. Will validate settings and prepare files for execute
@@ -604,6 +616,7 @@ class BakeWrangler_Input_HighPolyMesh(Node, BakeWrangler_Tree_Node):
 class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
     '''Mesh data and settings node'''
     bl_label = 'Mesh'
+    bl_width_default = 146
     
     # Returns the most identifing string for the node
     def get_name(self):
@@ -644,7 +657,13 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
             if self.mesh_object and len(self.get_objects()) < 2:
                 valid[0] = False
                 valid.append(_print("Cage enabled but no high poly objects selected", node=self, ret=True))
-                
+        # Check valid UV Map
+        if self.mesh_object and len(self.mesh_object.data.uv_layers) < 1:
+            valid[0] = False
+            valid.append(_print("Mesh object has no UV map(s)", node=self, ret=True))
+        if self.mesh_object and len(self.mesh_object.data.uv_layers) > 1 and self.uv_map and self.uv_map not in self.mesh_object.data.uv_layers:
+            valid[0] = False
+            valid.append(_print("Selected UV map not present on object (it could have been deleted or renamed)", node=self, ret=True))
         # Validated?
         if not valid[0]:
             return valid
@@ -737,7 +756,7 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
     multi_res_pass: bpy.props.EnumProperty(name="Pass", description="Choose shading information to bake into the image.\nMultires pass will override any connected bake pass", items=multi_res_passes, default='NORMALS')
     cage: bpy.props.BoolProperty(name="Cage", description="Cast rays to active object from a cage. The cage must have the same number of faces")
     cage_obj: bpy.props.PointerProperty(name="Cage Object", description="Object to use as a cage instead of calculating the cage from the active object", type=bpy.types.Object, poll=mesh_object_filter)
-    
+    uv_map: bpy.props.StringProperty(name="UV Map", description="Pick map to bake if object has multiple layers. Leave blank to use active layer")
     
     def init(self, context):
         # Sockets IN
@@ -750,6 +769,10 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
         layout.prop_search(self, "mesh_object", context.scene, "objects", text="")
         layout.prop(self, "margin", text="Margin")
         layout.prop(self, "mask_margin", text="Padding")
+        if self.mesh_object and len(self.mesh_object.data.uv_layers) > 1:
+            split = layout.split(factor=0.21)
+            split.label(text="UV:")
+            split.prop_search(self, "uv_map", self.mesh_object.data, "uv_layers", text="")
         layout.prop(self, "multi_res", text="From Multires")
         if not self.multi_res:
             if not self.cage:
@@ -767,6 +790,7 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
 class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     '''Baking pass node'''
     bl_label = 'Bake Pass'
+    bl_width_default = 144
     
     # Returns the most identifing string for the node
     def get_name(self):
@@ -949,6 +973,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
 class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     '''Output image path node'''
     bl_label = 'Output Image Path'
+    bl_width_default = 152
     
     # Returns the most identifing string for the node
     def get_name(self):
