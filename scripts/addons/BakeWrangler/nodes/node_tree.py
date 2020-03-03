@@ -32,7 +32,28 @@ def _print(str, node=None, ret=False, tag=False, wrap=True):
         return output
     else:
         print(output, end=endl, flush=flsh)
-    
+
+
+
+# Preference reader
+def _prefs(key):
+    try:
+        name = __package__.split('.')
+        prefs = bpy.context.preferences.addons[name[0]].preferences
+    except:
+        pref = False
+    else:
+        pref = True
+        
+    if pref and key in prefs:
+        return prefs[key]
+    else:
+        if key == 'debug':
+            return False
+        else:
+            return None
+
+
 
 #
 # Bake Wrangler Operators
@@ -116,6 +137,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
     def thread(self, node_name, tree_name, file_name, exec_name, script_name):
         tree = bpy.data.node_groups[self.tree]
         node = tree.nodes[self.node]
+        debug = _prefs('debug')
              
         _print("Launching background process:", node=node)
         _print("================================================================================")
@@ -127,6 +149,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             "--",
             "--tree", tree_name,
             "--node", node_name,
+            "--debug", str(int(debug)),
             ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         
         # Read output from subprocess and print tagged lines
@@ -378,6 +401,9 @@ class BakeWrangler_Tree(NodeTree):
     
     # Does this need a lock for modal event access?
     baking = None
+    
+    # Do some initial set up when a new tree is created
+    initialised: bpy.props.BoolProperty(name="Initialised", default=False)
         
 
 # Custom Sockets:
@@ -1417,10 +1443,37 @@ classes = (
 # get a better name than 'node tree' and switching to the editor should load the last
 # active tree up instead of nothing.
 from bpy.app.handlers import persistent
+post_hook_index = -1
 @persistent
-def test_handler(dummy):
-    print("Test Hanlder:", bpy.context)
-    
+def BakeWranger_Hook_Post_NewTree(dummy):
+    debug = _prefs('debug')
+    ctx = bpy.context
+    if ctx.area and ctx.area.ui_type == 'BakeWrangler_Tree':
+        if debug: _print("Starting post depsgraph update")
+        if len(ctx.area.spaces) > 0 and hasattr(ctx.area.spaces[0], 'node_tree'):
+            tree = ctx.area.spaces[0].node_tree
+            if tree and not tree.initialised:
+                if debug: _print("New/Uninitialised node tree active")
+                tree.use_fake_user = True
+                if tree.name.startswith("NodeTree"):
+                    num = 0
+                    for nodes in bpy.data.node_groups:
+                        if nodes.name.startswith("Bake Recipe"):
+                            if num == 0:
+                                num = 1
+                            splt = nodes.name.split('.')
+                            if len(splt) > 1 and splt[1].isnumeric:
+                                num = int(splt[1]) + 1
+                    if num == 0:
+                        name = "Bake Recipe"
+                    else:
+                        if debug: _print("Next highest name number selected '%d'" % (num))
+                        name = "Bake Recipe.%03d" % (num)
+                    tree.name = tree.name.replace("NodeTree", name, 1)
+                tree.initialised = True
+                if debug: _print("Tree initialised")
+
+
 
 def register():
     from bpy.utils import register_class
@@ -1428,16 +1481,22 @@ def register():
         register_class(cls)
 
     nodeitems_utils.register_node_categories('BakeWrangler_Nodes', BakeWrangler_Node_Categories)
-    #bpy.app.handlers.depsgraph_update_post.append(test_handler)
+    
+    post_hook_index = len(bpy.app.handlers.depsgraph_update_post)
+    bpy.app.handlers.depsgraph_update_post.append(BakeWranger_Hook_Post_NewTree)
+
 
 
 def unregister():
-    #bpy.app.handlers.depsgraph_update_post.remove(test_handler)
+    if post_hook_index <= (len(bpy.app.handlers.depsgraph_update_post) + 1):
+        bpy.app.handlers.depsgraph_update_post.pop(post_hook_index)
+        
     nodeitems_utils.unregister_node_categories('BakeWrangler_Nodes')
 
     from bpy.utils import unregister_class
     for cls in reversed(classes):
         unregister_class(cls)
+
 
 
 if __name__ == "__main__":

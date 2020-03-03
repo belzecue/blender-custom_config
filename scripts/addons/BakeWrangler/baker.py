@@ -10,8 +10,6 @@ except:
     from nodes import node_tree
     from nodes.node_tree import _print
 
-debug = False
-
 
 
 # Process the node tree with the given node as the starting point
@@ -870,6 +868,10 @@ def main():
         "-n", "--node", dest="node", type=str, required=True,
         help="Name of bakery node to start process from",
     )
+    parser.add_argument(
+        "-d", "--debug", dest="debug", type=int, required=False,
+        help="Enable debug messages",
+    )
 
     args = parser.parse_args(argv)
 
@@ -881,6 +883,12 @@ def main():
         print("Error: Bake Wrangler baker required arguments not found")
         return
     
+    global debug
+    if args.debug:
+        debug = bool(args.debug)
+    else:
+        debug = False
+    
     # Make sure the node classes are registered
     try:
         node_tree.register()
@@ -888,16 +896,6 @@ def main():
         print("Info: Bake Wrangler nodes already registered")
     else:
         print("Info: Bake Wrangler nodes registered")
-    
-    # Try to load preferences
-    try:
-        prefs = bpy.context.preferences.addons[os.path.basename(os.path.dirname(__file__))].preferences
-    except:
-        print("Info: Bake Wrangler couldn't load preferences, using defaults")
-    else:
-        print("Info: Bake Wrangler preferences loaded")
-        if hasattr(prefs, 'debug'):
-            debug = prefs['debug']
     
     # Start processing bakery node tree
     err = process_tree(args.tree, args.node)
