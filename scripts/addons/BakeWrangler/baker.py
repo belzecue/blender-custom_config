@@ -4,11 +4,13 @@ from datetime import datetime
 try:
     from BakeWrangler.nodes import node_tree
     from BakeWrangler.nodes.node_tree import _print
+    from BakeWrangler.nodes.node_tree import material_recursor
 except:
     import sys
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from nodes import node_tree
     from nodes.node_tree import _print
+    from nodes.node_tree import material_recursor
 
 
 
@@ -99,6 +101,8 @@ def process_bake_pass_input(node):
     norm_r = node.norm_R
     norm_g = node.norm_G
     norm_b = node.norm_B
+    # Settings for curvature pass
+    curve_px = node.curve_px
     # Settings for passes with selectable influence
     infl_direct = node.use_direct
     infl_indirect = node.use_indirect
@@ -149,7 +153,7 @@ def process_bake_pass_input(node):
     img_bake.alpha_mode = 'NONE'
     img_bake.colorspace_settings.name = 'Non-Color'
     img_bake.colorspace_settings.is_data = True
-    if bake_type == 'NORMAL':
+    if bake_type in ['NORMAL', 'CURVATURE', 'CURVE_SMOOTH']:
         img_bake.generated_color = (0.5, 0.5, 1.0, 1.0)
                 
     img_mask = bpy.data.images.new("mask_" + node.get_name(), width=x_res, height=y_res)
@@ -185,7 +189,6 @@ def process_bake_pass_input(node):
         
         # Load in template bake scene with mostly optimised settings for baking
         bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
-        bake_scene = None
         with bpy.data.libraries.load(bake_scene_path, link=False, relative=False) as (file_from, file_to):
             file_to.scenes.append("BakeWrangler")
         bake_scene = file_to.scenes[0]
@@ -271,7 +274,7 @@ def process_bake_pass_input(node):
         
         # Make single user copies of all materials still in play. Even if they wont be changed by this bake.
         bpy.ops.object.select_all(action='SELECT')
-        # Deselect the cage if its in use
+        # De-select the cage if its in use
         if cage:
             cage_cpy.select_set(False)
         bpy.ops.object.make_single_user(type='SELECTED_OBJECTS', object=False, obdata=False, material=True, animation=False)
@@ -282,6 +285,11 @@ def process_bake_pass_input(node):
             # Get materials from all the objects except the target
             for obj in object_cpys:
                 has_mat = False
+                if bake_type == 'CAVITY' and len(obj.material_slots):
+                    for slot in obj.material_slots:
+                        # Replace texture with cavity shader
+                        if slot.material != None:
+                            slot.material = cavity_shader
                 if len(obj.data.materials):
                     for mat in obj.data.materials:
                         # Slots can be empty
@@ -290,14 +298,25 @@ def process_bake_pass_input(node):
                             if unique_mats.count(mat) == 0:
                                 unique_mats.append(mat)
                 if not has_mat:
-                    # If the object has no materials, one needs to be added for the mask baking step
-                    mat = bpy.data.materials.new(name="mask_" + obj.name)
-                    mat.use_nodes = True
+                    # If the object has no materials, one needs to be added for the mask baking step or for cavity map
+                    if bake_type == 'CAVITY':
+                        mat = cavity_shader
+                    else:
+                        mat = bpy.data.materials.new(name="mask_" + obj.name)
+                        mat.use_nodes = True
                     obj.data.materials.append(mat)
                     if unique_mats.count(mat) == 0:
                         unique_mats.append(mat)
         else:
-            # Get materials from only the target
+            # Get materials from only the target and add cavity shader if needed
+            if bake_type == 'CAVITY':
+                if len(target_cpy.material_slots):
+                    for slot in target_cpy.material_slots:
+                        # Replace texture with cavity shader
+                        if slot.material != None:
+                            slot.material = cavity_shader
+                else:
+                    target_cpy.data.materials.append(cavity_shader)
             if len(target_cpy.data.materials):
                 for mat in target_cpy.data.materials:
                     # Slots can be empty
@@ -317,6 +336,7 @@ def process_bake_pass_input(node):
         
         # Prepare the materials for the bake type
         for mat in unique_mats:
+            if debug: _print(">    Preparing material [%s] for [%s] bake" % (mat.name, bake_type), tag=True)
             prep_material_for_bake(node, mat.node_tree, bake_type)
             
             if bake_strategy != 'TOACT':
@@ -326,24 +346,34 @@ def process_bake_pass_input(node):
                 image_node.select = True
                 mat.node_tree.nodes.active = image_node
         
+        # Set 'real' bake pass. PBR use EMIT rather than the named pass, since those passes don't exist.
+        if bake_type in node.bake_pbr:
+            real_bake_type = 'EMIT'
+        elif bake_type in ['CURVATURE', 'CURVE_SMOOTH']:
+            real_bake_type = 'NORMAL'
+            norm_s = 'TANGENT'
+            norm_r = 'POS_X'
+            norm_g = 'POS_Y'
+            norm_b = 'POS_Z'
+        else:
+            real_bake_type = bake_type
+            
+        if debug: _print(">     Real bake type set to [%s]" % (real_bake_type), tag=True)
+            
         start = datetime.now()
         _print(">    -Baking %s pass: " % (bake_type), tag=True, wrap=False)
         
-        # Set 'real' bake pass. PBR use EMIT rather than the named pass, since those passes don't exist.
-        if not bake_type in node.bake_built_in:
-            bake_type = 'EMIT'
-            
-        # Do the bake. Most of the properies can be passed as arguments to the operator.
+        # Do the bake. Most of the properties can be passed as arguments to the operator.
         try:
             if bake_strategy != 'MULTI':
                 bpy.ops.object.bake(
-                    type=bake_type,
+                    type=real_bake_type,
                     pass_filter=pass_influences,
                     margin=margin,
                     use_selected_to_active=to_active,
                     cage_extrusion=ray_dist,
                     cage_object=cage_obj_name,
-                    normal_space='TANGENT',
+                    normal_space=norm_s,
                     normal_r=norm_r,
                     normal_g=norm_g,
                     normal_b=norm_b,
@@ -410,6 +440,48 @@ def process_bake_pass_input(node):
         # Switch back to main scene before next pass. Nothing will be deleted so that the file can be examined for debugging.
         bpy.context.window.scene = prev_scene
     
+    # Perform compositor pass if needed
+    if bake_type == 'CURVATURE' or bake_type == 'CURVE_SMOOTH':
+        start = datetime.now()
+        _print(">   Compositing passes: ", tag=True, wrap=False)
+        
+        if debug: _print(">   Switching to compositor scene", tag=True)
+        
+        # Switch into compositor scene
+        prev_scene = bpy.context.window.scene
+        prev_layer = bpy.context.view_layer
+        bpy.context.window.scene = compositor_scene
+        # Trick to make the view layer stay the same on switching back maybe?
+        bpy.context.view_layer.name = prev_layer.name       
+        
+        # Hook up the correct compositor tree to the output node and set the input to the bake data
+        if debug: _print(">   Setting composit tree input and output", tag=True)
+        comp_nodes = bpy.context.window.scene.node_tree.nodes
+        comp_links = bpy.context.window.scene.node_tree.links
+        if bake_type == 'CURVATURE':
+            comp_out = 'curve_out'
+        else:
+            comp_out = 'curve_smooth_out'
+        
+        comp_nodes['bw_smooth_input'].image = img_bake
+        comp_links.new(comp_nodes[comp_out].outputs[0], comp_nodes['bw_smooth_render'].inputs[0])
+        
+        # Render output
+        bpy.context.window.scene.render.resolution_x = x_res
+        bpy.context.window.scene.render.resolution_y = y_res
+        bpy.ops.render.render(write_still=True, use_viewport=False)
+        comp_img = bpy.data.images.load(bpy.context.window.scene.render.filepath + bpy.context.window.scene.render.file_extension)
+        
+        if debug: _print(">   Copying composit image (%dpx) to bake data (%dpx)" % (len(comp_img.pixels), len(img_bake.pixels)), tag=True)
+        
+        # Replace bake data with composit
+        if len(comp_img.pixels) == len(img_bake.pixels):
+            img_bake.pixels = comp_img.pixels[:]
+            img_bake.update()
+        
+        _print("Completed in %s" % (str(datetime.now() - start)), tag=True)
+        bpy.context.window.scene = prev_scene
+        
     _print(">", tag=True)   
     _print(">  Input Meshes processed in %s" % (str(datetime.now() - pass_start)), tag=True)
     
@@ -451,6 +523,7 @@ def process_bake_pass_output(node, bake, mask, target=None):
                        output_node.inputs['Alpha'].is_linked and output_node.inputs['Alpha'].valid]
         
         # Convert bake to selected color space
+        _print(">   - Performing color space conversion to: %s" % (output_node.img_color_space), tag=True)
         err, bake_copy, img_scene = convert_to_color_space(bake, output_node.img_color_space, node.bake_device)
         mask_copy = mask
         
@@ -732,11 +805,82 @@ def convert_to_color_space(bake, color_space, device):
     
 
 
+# Takes a node of type OUTPUT_MATERIAL, BSDF_PRINCIPLED or MIX_SHADER. Starting with an output node it will
+# recursively generate an emission shader to replace the output with the desired bake type. The link_socket
+# is used for creating node tree links.
+def prep_material_rec(node, link_socket, bake_type):
+    tree = node.id_data
+    nodes = tree.nodes
+    links = tree.links
+    # Three cases:
+    if node.type == 'OUTPUT_MATERIAL':
+        # Start of shader. Create new emission shader and connect it to the output
+        next_node = link_socket.links[0].from_node
+        node_emit = nodes.new('ShaderNodeEmission')
+        links.new(node_emit.outputs['Emission'], link_socket)
+        # Recurse
+        return prep_material_rec(next_node, node_emit.inputs['Color'], bake_type)
+        
+    if node.type == 'MIX_SHADER':
+        # Mix shader needs to generate a mix RGB maintaining the same Fac input if linked
+        mix_node = nodes.new('ShaderNodeMixRGB')
+        if node.inputs['Fac'].is_linked:
+            # Connect Fac input
+            links.new(node.inputs['Fac'].links[0].from_socket, mix_node.inputs['Fac'])
+        else:
+            # Set Fac value to match instead
+            mix_node.inputs['Fac'].default_value = node.inputs['Fac'].default_value
+        # Connect mix output to previous socket
+        links.new(mix_node.outputs['Color'], link_socket)
+        # Recurse
+        branchA = prep_material_rec(node.inputs[1].links[0].from_node, mix_node.inputs['Color1'], bake_type)
+        branchB = prep_material_rec(node.inputs[2].links[0].from_node, mix_node.inputs['Color2'], bake_type)
+        return branchA and branchB
+        
+    if node.type == 'BSDF_PRINCIPLED':
+        # End of a branch as far as the prep is concerned. Either link the desired bake value or set the
+        # previous socket to the value if it isn't linked
+        if bake_type == 'ALBEDO':
+            bake_input = node.inputs['Base Color']
+        elif bake_type == 'METALLIC':
+            bake_input = node.inputs['Metallic']
+        elif bake_type == 'ALPHA':
+            bake_input = node.inputs['Alpha']
+        else:
+            bake_input = None
+            
+        if debug: _print(">      Reached branch end, ", tag=True, wrap=False)
+            
+        if bake_input:
+            if bake_input.is_linked:
+                if debug: _print("Link found, [%s] will be connected" % (bake_input.links[0].from_socket), tag=True)
+                # Connect the linked node up to the emit shader
+                links.new(bake_input.links[0].from_socket, link_socket)
+            else:
+                if debug: _print("Not linked, value will be copied", tag=True)
+                # Copy the value into the socket instead
+                if bake_input.type == 'RGBA':
+                    link_socket.default_value = bake_input.default_value
+                else:
+                    link_socket.default_value[0] = bake_input.default_value
+                    link_socket.default_value[1] = bake_input.default_value
+                    link_socket.default_value[2] = bake_input.default_value
+                    link_socket.default_value[3] = 1.0
+            # Branch completed
+            return True
+            
+    # Something went wrong
+    if debug: _print(">      Error: Reached unsupported node type", tag=True)
+    return False
+
+
+
 # Takes a materials node tree and makes any changes necessary to perform the given bake type. A material must
-# end with a principled shader connected to a material output in order to be set up for any emission node bakes.
+# end with principled shader(s) and mix shader(s) connected to a material output in order to be set up for any
+# emission node bakes.
 def prep_material_for_bake(node, node_tree, bake_type):
-    # Bake types with built-in passes don't require any perperation
-    if not node_tree or bake_type in node.bake_built_in:
+    # Bake types with built-in passes don't require any preparation
+    if not node_tree or bake_type in node.bake_built_in or bake_type == 'CURVATURE' or bake_type == 'CURVE_SMOOTH' or bake_type == 'CAVITY':
         return
     
     # Mask is a special case where an emit shader and output can just be added to any material
@@ -778,7 +922,6 @@ def prep_material_for_bake(node, node_tree, bake_type):
     node_generic_out_active = []
     node_generic_out = []
     node_selected_output = None
-    node_selected_shader = None
     
     # Collect all outputs
     for node in nodes:
@@ -792,49 +935,25 @@ def prep_material_for_bake(node, node_tree, bake_type):
                 if node.is_active_output:
                     node_generic_out_active.append(node)
                 else:
-                    node_generic_outputs.append(node)
+                    node_generic_out.append(node)
                 
     # Select the first usable output using the order explained above and make sure no other outputs are set active
     node_outputs = node_cycles_out_active + node_cycles_out + node_generic_out_active + node_generic_out
     for node in node_outputs:
         input = node.inputs['Surface']
-        if not node_selected_output and input.is_linked and input.links[0].from_node.type == 'BSDF_PRINCIPLED':
+        if not node_selected_output and material_recursor(node):
             node_selected_output = node
-            node_selected_shader = input.links[0].from_node
             node.is_active_output = True
         else:
             node.is_active_output = False
     
-    if not node_selected_output or not node_selected_shader:
+    if not node_selected_output:
         return
     
-    # Output and Shader have been chosen. Next pick the shader input based on bake type
-    node_shader_input = None
-    if bake_type == 'ALBEDO':
-        node_shader_input = node_selected_shader.inputs['Base Color']
-    elif bake_type == 'METALIC':
-        node_shader_input = node_selected_shader.inputs['Metallic']
-    elif bake_type == 'ALPHA':
-        node_shader_input = node_selected_shader.inputs['Alpha']
-
-    # Add emission shader and connect it to the output
-    node_emit = nodes.new('ShaderNodeEmission')
-    node_tree.links.new(node_emit.outputs['Emission'], node_selected_output.inputs['Surface'])
-    
-    # The input value can either be coming from a linked node or be set on the node. Either connect the link
-    # or copy the value
-    if node_shader_input.is_linked:
-        node_tree.links.new(node_shader_input.links[0].from_socket, node_emit.inputs[0])
-    else:
-        if node_shader_input.type == 'RGBA':
-            node_emit.inputs[0].default_value = node_shader_input.default_value
-        else:
-            node_emit.inputs[0].default_value[0] = node_shader_input.default_value
-            node_emit.inputs[0].default_value[1] = node_shader_input.default_value
-            node_emit.inputs[0].default_value[2] = node_shader_input.default_value
-            node_emit.inputs[0].default_value[3] = 1.0
-            
-    return
+    # Output has been selected. An emission shader will now be built, replacing mix shaders with mix RGB
+    # nodes and principled shaders with just the desired data for the bake type. Recursion used.
+    if debug: _print(">     Chosen output [%s] decending tree:" % (node_selected_output.name), tag=True)
+    return prep_material_rec(node_selected_output, node_selected_output.inputs['Surface'], bake_type)
 
 
 
@@ -854,7 +973,7 @@ def main():
 
     # When --help or no args are given, print this help
     usage_text = (
-        "This scipt is used internally by Bake Wrangler addon."
+        "This script is used internally by Bake Wrangler add-on."
     )
 
     parser = argparse.ArgumentParser(description=usage_text)
@@ -888,6 +1007,7 @@ def main():
         debug = bool(args.debug)
     else:
         debug = False
+        #debug = True
     
     # Make sure the node classes are registered
     try:
@@ -896,6 +1016,16 @@ def main():
         print("Info: Bake Wrangler nodes already registered")
     else:
         print("Info: Bake Wrangler nodes registered")
+    
+    # Load shaders and scenes
+    bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
+    with bpy.data.libraries.load(bake_scene_path, link=False, relative=False) as (file_from, file_to):
+        file_to.materials.append("BW_Cavity_Map")
+        file_to.scenes.append("BakeWranglerComp")
+    global cavity_shader
+    cavity_shader = file_to.materials[0]
+    global compositor_scene
+    compositor_scene = file_to.scenes[0]
     
     # Start processing bakery node tree
     err = process_tree(args.tree, args.node)

@@ -55,6 +55,26 @@ def _prefs(key):
 
 
 
+# Material validation recursor (takes a shader node and descends the tree via recursion)
+def material_recursor(node):
+    # Accepted node types are OUTPUT_MATERIAL, BSDF_PRINCIPLED and MIX_SHADER
+    if node.type == 'BSDF_PRINCIPLED':
+        return True
+    if node.type == 'OUTPUT_MATERIAL' and node.inputs['Surface'].is_linked:
+        return material_recursor(node.inputs['Surface'].links[0].from_node)
+    if node.type == 'MIX_SHADER':
+        inputA = False
+        if node.inputs[1].is_linked:
+            inputA = material_recursor(node.inputs[1].links[0].from_node)
+        inputB = False
+        if node.inputs[2].is_linked:
+            inputB = material_recursor(node.inputs[2].links[0].from_node)
+        return inputA and inputB
+        
+    return False
+                    
+
+
 #
 # Bake Wrangler Operators
 #
@@ -159,7 +179,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             # Check for kill flag
             if self._lock.acquire(blocking=False):
                 if self._kill:
-                    _print("Bake cancelled, terminating process...")
+                    _print("Bake canceled, terminating process...")
                     sub.kill()
                     out, err = sub.communicate()
                     kill = True
@@ -393,6 +413,8 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
 # Bake Wrangler nodes system
 #
 
+BW_TREE_VERSION = 1
+
 # Node tree definition that shows up in the editor type list. Sets the name, icon and description.
 class BakeWrangler_Tree(NodeTree):
     '''Improved baking system to extend and replace existing internal bake system'''
@@ -404,6 +426,7 @@ class BakeWrangler_Tree(NodeTree):
     
     # Do some initial set up when a new tree is created
     initialised: bpy.props.BoolProperty(name="Initialised", default=False)
+    tree_version: bpy.props.IntProperty(name="Tree Version", default=BW_TREE_VERSION)
         
 
 # Custom Sockets:
@@ -734,14 +757,13 @@ class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
                             
                 # Try to find at least one usable node pair from the outputs
                 for node in node_outputs:
-                    input = node.inputs['Surface']
-                    if input.is_linked and input.links[0].from_node.type == 'BSDF_PRINCIPLED':
-                        passed = True
+                    passed = material_recursor(node)
+                    if passed:
                         break
                 
                 # Didn't find any usable node pairs
                 if not passed:
-                    valid.append(_print("'%s' No Principled Shader -> Material Output node set up" % (mat.name), node=self, ret=True))
+                    valid.append(_print("'%s' Output doesn't appear to be a valid combination of Principled and Mix shaders. Baked values will not be correct for this material." % (mat.name), node=self, ret=True))
                      
         return valid
     
@@ -836,10 +858,10 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         has_valid_input = False
         for input in self.inputs:
             if input.is_linked and input.links[0].is_valid and input.valid:
-                if self.bake_pass in self.bake_built_in:
-                    input_valid = input.links[0].from_node.validate()
-                else:
+                if self.bake_pass in self.bake_pbr:
                     input_valid = input.links[0].from_node.validate(check_materials=True)
+                else:
+                    input_valid = input.links[0].from_node.validate()
                 if not input_valid[0]:
                     valid[0] = input_valid.pop(0)
                     valid += input_valid
@@ -874,12 +896,15 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     
     bake_passes = (
         ('ALBEDO', "Albedo", "Surface color without lighting (Principled shader only)"),
-        ('METALIC', "Metalic", "Surface metalness values (Principled shader only)"),
+        ('METALLIC', "Metallic", "Surface 'metalness' values (Principled shader only)"),
         ('ALPHA', "Alpha", "Surface transparency values (Principled shader only)"),
         
-        ('NORMAL', "Normal", "Surface tangent normals"),
+        ('NORMAL', "Normal", "Surface normals"),
+        ('CURVATURE', "Curvature", "Surface curvature map computed from tangent normals"),
+        ('CURVE_SMOOTH', "Curvature (Smoothed)", "Curvature map with smoothing applied"),
         ('ROUGHNESS', "Roughness", "Surface roughness values"),
         ('AO', "Ambient Occlusion", "Surface self occlusion values"),
+        ('CAVITY', "Cavity", "Surface cavity occlusion map"),
         
         ('SUBSURFACE', "Subsurface", "Subsurface color"),
         ('TRANSMISSION', "Transmission", "Colors of light passing through a material"),
@@ -893,6 +918,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     )
     
     bake_built_in = ['NORMAL', 'ROUGHNESS', 'AO', 'SUBSURFACE', 'TRANSMISSION', 'GLOSSY', 'DIFFUSE', 'ENVIRONMENT', 'EMIT', 'UV', 'SHADOW', 'COMBINED']
+    bake_pbr = ['ALBEDO', 'METALLIC', 'ALPHA', 'CAVITY']
     bake_has_influence = ['SUBSURFACE', 'TRANSMISSION', 'GLOSSY', 'DIFFUSE', 'COMBINED']
     
     normal_spaces = (
@@ -933,7 +959,8 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     use_subsurface: bpy.props.BoolProperty(name="Subsurface", description="Add subsurface contribution", default=True)
     use_ao: bpy.props.BoolProperty(name="Ambient Occlusion", description="Add ambient occlusion contribution", default=True)
     use_emit: bpy.props.BoolProperty(name="Emit", description="Add emission contribution", default=True)
-
+    curve_px: bpy.props.IntProperty(name="Curve Pixel Width", description="Curvature edge pixel width", default=1)
+    
     def init(self, context):
         # Sockets IN
         self.inputs.new('BakeWrangler_Socket_Mesh', "Mesh")
@@ -960,6 +987,10 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
             col.prop(self, "norm_R", text="")
             col.prop(self, "norm_G", text="")
             col.prop(self, "norm_B", text="")
+        elif self.bake_pass == 'CURVATURE':
+            split = layout.split(factor=0.5)
+            split.label(text="Px Width:")
+            split.prop(self, "curve_px", text="")
         elif self.bake_pass in self.bake_has_influence:
             row = layout.row(align=True)
             row.use_property_split = False
