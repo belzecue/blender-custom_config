@@ -50,6 +50,7 @@ def _prefs(key):
     else:
         if key == 'debug':
             return False
+            #return True
         else:
             return None
 
@@ -170,7 +171,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             "--tree", tree_name,
             "--node", node_name,
             "--debug", str(int(debug)),
-            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         
         # Read output from subprocess and print tagged lines
         out = ""
@@ -312,7 +313,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         log_err = None
         blend_log = None
         try:
-            blend_log = open(blend_copy + ".log", "a")
+            blend_log = open(blend_copy + ".log", "a", encoding="utf-8", errors="replace")
         except OSError as err:
             self.report({'WARNING'}, "Couldn't create log file")
             log_err = err.strerror
@@ -327,7 +328,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             _print(" - Log file creation failed: %s" % (log_err), node=node)
         
         # Create a thread which will launch a background instance of blender running a script that does all the work.
-        # Proccess is complete when thread exits. Will need full path to blender, node, temp file and proc script.
+        # Process is complete when thread exits. Will need full path to blender, node, temp file and proc script.
         blend_exec = bpy.path.abspath(bpy.app.binary_path)
         self._thread = threading.Thread(target=self.thread, args=(self.node, self.tree, self.blend_copy, blend_exec, self.bake_proc,))
         
@@ -348,13 +349,12 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         tree.baking = self
         tree.interface_update(context)
         self.valid = node.validate(is_primary=True)
-        
         # Check processing script exists
         bake_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
         bake_proc = bpy.path.abspath(os.path.join(bake_path, "baker.py"))
         if not os.path.exists(bake_proc):
             self.valid[0] = False
-            self.valid.append(_print("Bake processing script wasn't found at '%s'" % (bake_proc), node=node, ret=True))
+            self.valid.append([_print("File missing", node=node, ret=True), ": Bake processing script wasn't found at '%s'" % (bake_proc)])
         else:
             self.bake_proc = bake_proc
         
@@ -362,7 +362,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         scene_file = bpy.path.abspath(os.path.join(bake_path, "resources", "BakeWrangler_Scene.blend"))
         if not os.path.exists(scene_file):
             self.valid[0] = False
-            self.valid.append(_print("Bake scene wasn't found at '%s'" % (scene_file), node=node, ret=True))
+            self.valid.append([_print("File missing", node=node, ret=True), ": Bake scene library wasn't found at '%s'" % (scene_file)])
         
         # Draw pop-up that will use custom draw function to display any validation errors
         return context.window_manager.invoke_props_dialog(self, width=400)
@@ -379,7 +379,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             tree.baking = None
             tree.interface_update(context)
     
-    # Draw custom popup
+    # Draw custom pop-up
     def draw(self, context):
         tree = bpy.data.node_groups[self.tree]
         node = tree.nodes[self.node]
@@ -390,8 +390,8 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             _print("!!! Validation FAILED:", node=node)
             col = layout.column()
             for i in range(len(self.valid) - 1):
-                col.label(text=self.valid[i + 1])
-                _print(self.valid[i + 1])
+                col.label(text=self.valid[i + 1][0])
+                _print(self.valid[i + 1][0] + self.valid[i + 1][1])
             layout.label(text="See console for details")
             _print("")
         else:
@@ -403,8 +403,8 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
                 _print("!!! Material Warnings:")
                 col = layout.column()
                 for i in range(len(self.valid) - 1):
-                    col.label(text=self.valid[i + 1])
-                    _print(self.valid[i + 1])
+                    col.label(text=self.valid[i + 1][0])
+                    _print(self.valid[i + 1][0] + self.valid[i + 1][1])
             layout.label(text="See console for progress information and warnings")
 
 
@@ -413,7 +413,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
 # Bake Wrangler nodes system
 #
 
-BW_TREE_VERSION = 1
+BW_TREE_VERSION = 3
 
 # Node tree definition that shows up in the editor type list. Sets the name, icon and description.
 class BakeWrangler_Tree(NodeTree):
@@ -425,8 +425,8 @@ class BakeWrangler_Tree(NodeTree):
     baking = None
     
     # Do some initial set up when a new tree is created
-    initialised: bpy.props.BoolProperty(name="Initialised", default=False)
-    tree_version: bpy.props.IntProperty(name="Tree Version", default=BW_TREE_VERSION)
+    initialised: bpy.props.BoolProperty(name="Initialized", default=False)
+    tree_version: bpy.props.IntProperty(name="Tree Version", default=0)
         
 
 # Custom Sockets:
@@ -449,62 +449,181 @@ class BakeWrangler_Tree_Socket:
             return color
     
 
-# Socket for sharing high poly mesh, or really any mesh data that should be in the bake but isn't the target
-class BakeWrangler_Socket_HighPolyMesh(NodeSocket, BakeWrangler_Tree_Socket):
-    '''Socket for connecting a high poly mesh node'''
-    bl_label = 'Bake From'
+# Socket for an object or list of objects to be used in a bake pass in some way
+class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
+    '''Socket for baking relevant objects'''
+    bl_label = 'Object'
     
-    # Called to filter objects listed in the value search field. Only objects of type 'MESH' are shown.
+    object_types = ['MESH', 'CURVE', 'SURFACE', 'META', 'FONT', 'LIGHT']
+    
+    # Called to filter objects listed in the value search field
     def value_prop_filter(self, object):
-        if self.collection:
-            return len(object.all_objects)
-        else:
-            return object.type in ['MESH', 'CURVE']
-    
-    # Called when the value property changes.
-    def value_prop_update(self, context):
-        if self.node and self.node.bl_idname == 'BakeWrangler_Input_HighPolyMesh':
-            self.node.update_inputs()
-    
-    # Called when the collection property changes
-    def collection_prop_update(self, context):
-        if self.collection == False and self.value:
-            self.value = None
+        return self.node.input_filter(self.name, object)
         
-    value: bpy.props.PointerProperty(name="Bake From Object(s)", description="Geometry to be part of selection when doing a 'selected to active' type bake", type=bpy.types.ID, poll=value_prop_filter, update=value_prop_update)
-    collection: bpy.props.BoolProperty(name="Collection", description="When enabled whole collections will be selected instead of individual objects", update=collection_prop_update, default=False)
+    def cage_prop_filter(self, cage):
+        return cage.type == 'MESH'
+    
+    # Try to auto locate the cage by name when enabled
+    def use_cage_update(self, context):
+        if self.use_cage and not self.cage and self.value:
+            for obj in bpy.data.objects:
+                if obj.name.startswith(self.value.name) and obj.name.lower().startswith("cage", len(self.value.name) + 1):
+                    self.cage = obj
+                    break
+            
+    # Called when the value property changes
+    def value_prop_update(self, context):
+        self.type = 'NONE'
+        if self.value:
+            if self.value.rna_type.identifier == 'Collection':
+                self.type = 'GROUP'
+            elif self.value.rna_type.identifier == 'Object':
+                if self.value.type in self.object_types:
+                    self.type = '%s_DATA' % (self.value.type)                
+        if self.node:
+            self.node.update_inputs()
+            
+    # Get own objects or the full linked tree
+    def get_objects(self, only_mesh=False):
+        objects = []
+        # Follow links
+        if self.is_linked and self.valid:
+            return self.links[0].from_node.get_objects(only_mesh)
+        # Otherwise return self values
+        if self.value and self.type and self.type != 'NONE' and not self.is_linked:
+            # Only interested in mesh types?
+            if self.type not in ['MESH_DATA', 'GROUP'] and only_mesh:
+                return []
+            # Need to get all the grouped objects
+            if self.type == 'GROUP':
+                filter = self.object_types
+                if only_mesh:
+                    filter = ['MESH']
+                # Iterate over the objects applying the type filter
+                for obj in self.get_grouped():
+                    if obj.type in filter:
+                        objects.append([obj])
+            # Mesh data can have a few extra properties
+            elif self.type == 'MESH_DATA':
+                uv_map = ""
+                if self.pick_uv and self.uv_map:
+                    uv_map = self.uv_map
+                cage = None
+                if self.use_cage and self.cage:
+                    cage = self.cage
+                objects.append([self.value, uv_map, cage])
+            else:
+                objects.append([self.value])
+        return objects
+    
+    # Return objects contained in a group
+    def get_grouped(self):
+        if self.recursive:
+            return self.value.all_objects
+        else:
+            return self.value.objects
+            
+    # Validate value(s)
+    def validate(self, check_materials=False, check_as_active=False, check_multi=False):
+        valid = [True]
+        # Follow links
+        if self.is_linked and self.valid:
+            return self.links[0].from_node.validate(check_materials, check_as_active, check_multi)
+        # Has a value and isn't linked
+        if self.value and self.type and not self.is_linked:
+            objs = [self.value]
+            if self.type == 'GROUP':
+                objs = self.get_grouped()
+                
+            # Iterate over objs, it will just be one object unless the type is group (but maintains a single algo for both)
+            for obj in objs:
+                # Perform checks needed for an active bake target
+                if check_as_active:
+                    # Only a mesh type object can be a valid target, it will just be silently ignored
+                    if obj.type != 'MESH':
+                        return valid
+                    # Check the cage is valid if one is in use (can't be done for grouped objects)
+                    if self.type != 'GROUP' and not check_multi and self.use_cage and self.cage:
+                        if len(obj.data.polygons) != len(self.cage.data.polygons):
+                            valid[0] = False
+                            valid.append([_print("Cage error", node=self.node, ret=True), ": Cage <%s> face count does not match object <%s>." % (self.cage.name, obj.name)])
+                    # Any UV map?
+                    if len(obj.data.uv_layers) < 1:
+                        valid[0] = False
+                        valid.append([_print("UV error", node=self.node, ret=True), ": No UV Maps found on object <%s>." % (obj.name)])
+                    # Custom UV map still exists? (can't be done for grouped objects)
+                    if self.type != 'GROUP' and self.pick_uv and self.uv_map not in obj.data.uv_layers and self.uv_map != "":
+                        valid[0] = False
+                        valid.append([_print("UV error", node=self.node, ret=True), ": Selected UV map <%s> not present on object <%s> (it could have been deleted or renamed)" % (self.uv_map, obj.name)])
+                    # Check for a valid multi-res mod if enabled 
+                    if check_multi:
+                        has_multi_mod = False
+                        if len(obj.modifiers):
+                            for mod in obj.modifiers:
+                                if mod.type == 'MULTIRES' and mod.total_levels > 0:
+                                    has_multi_mod = True
+                                    break
+                        if not has_multi_mod:
+                            valid[0] = False
+                            valid.append([_print("Multires error", node=self.node, ret=True), ": No multires data on object <%s>." % (obj.name)])
+                # Check that materials can be converted to enable PBR data bakes
+                if check_materials:
+                    mats = []
+                    if len(obj.data.materials):
+                        for mat in obj.data.materials:
+                            if not mat in mats:
+                                mats.append(mat)
+                                # Is node based?
+                                if not mat.node_tree.nodes:
+                                    valid.append([_print("Material warning", node=self.node, ret=True), ": <%s> not a node based material" % (mat.name)])
+                                    continue
+                                # Is a 'principled' material?
+                                passed = False
+                                for node in mat.node_tree.nodes:
+                                    if node.type == 'OUTPUT_MATERIAL' and node.target in ['CYCLES', 'ALL']:
+                                        if material_recursor(node):
+                                            passed = True
+                                            break
+                                if not passed:
+                                    valid.append([_print("Material warning", node=self.node, ret=True), ": <%s> Output doesn't appear to be a valid combination of Principled and Mix shaders. Baked values will not be correct for this material." % (mat.name)])     
+        return valid
+            
+    # Blender Properties
+    value: bpy.props.PointerProperty(name="Object", description="Object to be used in some way in a bake pass", type=bpy.types.ID, poll=value_prop_filter, update=value_prop_update)
+    type: bpy.props.StringProperty(name="Type", description="ID String of value type", default="NONE")
     recursive: bpy.props.BoolProperty(name="Recursive Selection", description="When enabled all collections within the selected collection will be used", default=False)
+    pick_uv: bpy.props.BoolProperty(name="Pick UV Map", description="Enables selecting which UV map to use instead of the active one", default=False)
+    uv_map: bpy.props.StringProperty(name="UV Map", description="UV Map to use instead of active if value is a mesh", default="")
+    use_cage: bpy.props.BoolProperty(name="Use Cage", description="Enables cage usage and selection of cage mesh", default=False, update=use_cage_update)
+    cage: bpy.props.PointerProperty(name="Cage", description="Mesh to use a cage", type=bpy.types.Object, poll=cage_prop_filter)
     
     def draw(self, context, layout, node, text):
-        if node.bl_idname == 'BakeWrangler_Input_Mesh' and node.multi_res:
-            layout.label(text=text + " [ignored]")
-        elif not self.is_output and not self.is_linked and node.bl_idname != 'BakeWrangler_Input_Mesh':
-            row = layout.row()
-            if self.collection:
-                if self.value:
-                    row.prop_search(self, "value", context.scene.collection, "children", text="", icon='GROUP')
-                else:
-                    row.prop(self, "collection", icon='GROUP', text="")
-                    row.prop_search(self, "value", context.scene.collection, "children", text="", icon='NONE')
-                row.prop(self, "recursive", icon='OUTLINER', text="")
+        if not self.is_output and not self.is_linked:
+            row = layout.row(align=True)
+            label = ""
+            if self.name in ['Target', 'Source', 'Scene']:
+                label = self.name
+            if self.name in ['Target', 'Source'] or (hasattr(node, "filter_collection") and not node.filter_collection):
+                row.prop_search(self, "value", bpy.data, "objects", text=label, icon=self.type)
             else:
-                ico = 'NONE'
-                if self.value:
-                    obj = bpy.types.Object(self.value)
-                    if  obj.type == 'MESH':
-                        ico = 'MESH_DATA'
-                    elif obj.type == 'CURVE':
-                        ico = 'CURVE_DATA'
-                else:
-                    row.prop(self, "collection", icon='GROUP', text="")
-                row.prop_search(self, "value", context.scene, "objects", text="", icon=ico)
+                row.prop_search(self, "value", bpy.data, "collections", text=label, icon=self.type)
+            if self.value and self.type:
+                if self.type == 'GROUP':
+                    row.prop(self, "recursive", icon='OUTLINER', text="")
+                if self.type == 'MESH_DATA':
+                    row.prop(self, "pick_uv", icon='UV', text="")
+                    if self.pick_uv:
+                        row.prop_search(self, "uv_map", self.value.data, "uv_layers", text="", icon='UV_DATA')
+                    row.prop(self, "use_cage", icon='FILE_VOLUME', text="")
+                    if self.use_cage:
+                        row.prop_search(self, "cage", bpy.data, "objects", text="", icon='MESH_DATA')
         else:
             layout.label(text=BakeWrangler_Tree_Socket.socket_label(self, text))
 
     def draw_color(self, context, node):
         return BakeWrangler_Tree_Socket.socket_color(self, (0.0, 0.2, 1.0, 1.0))
+        
     
-
 # Socket for sharing a target mesh
 class BakeWrangler_Socket_Mesh(NodeSocket, BakeWrangler_Tree_Socket):
     '''Socket for connecting a mesh node'''
@@ -594,7 +713,7 @@ class BakeWrangler_Tree_Node:
     # Validate incoming links
     def insert_link(self, link):
         if link.to_node == self:
-            if link.from_socket.bl_idname == link.to_socket.bl_idname:
+            if link.from_socket.bl_idname == link.to_socket.bl_idname and link.is_valid:
                 link.to_socket.valid = True
             else:
                 link.to_socket.valid = False
@@ -617,228 +736,229 @@ class BakeWrangler_Tree_Node:
             op.node = self.name
 
 
-# Input node that takes any number of objects that should be selected durning a bake
-class BakeWrangler_Input_HighPolyMesh(Node, BakeWrangler_Tree_Node):
-    '''High poly mesh data node'''
-    bl_label = 'Bake From'
+# Input node that contains a list of objects relevant to baking
+class BakeWrangler_Input_ObjectList(Node, BakeWrangler_Tree_Node):
+    '''Object list node'''
+    bl_label = 'Objects'
+    bl_width_default = 198
     
     # Makes sure there is always one empty input socket at the bottom by adding and removing sockets
     def update_inputs(self):
-        BakeWrangler_Tree_Node.update_inputs(self, 'BakeWrangler_Socket_HighPolyMesh', "Bake From")
+        BakeWrangler_Tree_Node.update_inputs(self, 'BakeWrangler_Socket_Object', "Object")
+        
+    # Determine if object meets current input filter
+    def input_filter(self, input_name, object):
+        if self.filter_collection:
+            if object.rna_type.identifier == 'Collection':
+                return True
+        elif object.rna_type.identifier == 'Object':
+            if (self.filter_mesh and object.type == 'MESH') or \
+               (self.filter_curve and object.type == 'CURVE') or \
+               (self.filter_surface and object.type == 'SURFACE') or \
+               (self.filter_meta and object.type == 'META') or \
+               (self.filter_font and object.type == 'FONT') or \
+               (self.filter_light and object.type == 'LIGHT'):
+                return True
+        return False
     
-    # Returns a list of all chosen mesh objects. May recurse through multiple connected nodes.
-    def get_objects(self):
+    # Get all objects in tree from this node (mostly just uses the sockets methods)
+    def get_objects(self, only_mesh=False):
         objects = []
         for input in self.inputs:
-            if not input.is_linked:
-                if input.value:
-                    if input.collection:
-                        col_objects = []
-                        if input.recursive:
-                            col_objects = input.value.all_objects
-                        else:
-                            col_objects = input.value.objects
-                        visible_objects = [ob for ob in col_objects if ob.type in ['MESH', 'CURVE']]
-                        for ob in visible_objects:
-                            objects.append(ob)
-                    else:
-                        objects.append(input.value)
-            else:
-                linked_objects = []
-                if input.links[0].is_valid and input.valid:
-                    linked_objects = input.links[0].from_node.get_objects()
-                if len(linked_objects):
-                    objects.extend(linked_objects)
+            in_objs = input.get_objects(only_mesh)
+            if len(in_objs):
+                objects += in_objs
         return objects
-    
+        
+    # Validate all objects in tree from this node (mostly just uses the sockets methods)
+    def validate(self, check_materials=False, check_as_active=False, check_multi=False):
+        valid = [True]
+        for input in self.inputs:
+            valid_input = input.validate(check_materials, check_as_active, check_multi)
+            if not valid_input.pop(0):
+                valid[0] = False
+            if len(valid_input):
+                valid += valid_input
+        return valid
+        
+    filter_mesh: bpy.props.BoolProperty(name="Meshes", description="Show mesh type objects", default=True)
+    filter_curve: bpy.props.BoolProperty(name="Curves", description="Show curve type objects", default=True)
+    filter_surface: bpy.props.BoolProperty(name="Surfaces", description="Show surface type objects", default=True)
+    filter_meta: bpy.props.BoolProperty(name="Metas", description="Show meta type objects", default=True)
+    filter_font: bpy.props.BoolProperty(name="Fonts", description="Show font type objects", default=True)
+    filter_light: bpy.props.BoolProperty(name="Lights", description="Show light type objects", default=True)
+    filter_collection: bpy.props.BoolProperty(name="Collections", description="Toggle only collections", default=False)
+        
     def init(self, context):
         # Sockets IN
-        self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "Bake From")
+        self.inputs.new('BakeWrangler_Socket_Object', "Object")
         # Sockets OUT
-        self.outputs.new('BakeWrangler_Socket_HighPolyMesh', "Bake From")
+        self.outputs.new('BakeWrangler_Socket_Object', "Objects")
   
     def draw_buttons(self, context, layout):
-        layout.label(text="Objects:")
-
-
-# Input node that takes a single target mesh and its bake settings. High poly mesh nodes can be added as input.
-class BakeWrangler_Input_Mesh(Node, BakeWrangler_Tree_Node):
-    '''Mesh data and settings node'''
-    bl_label = 'Mesh'
-    bl_width_default = 146
-    
-    # Returns the most identifing string for the node
-    def get_name(self):
-        name = BakeWrangler_Tree_Node.get_name(self)
-        if self.mesh_object:
-            name += " (%s)" % (self.mesh_object.name)
-        return name
+        row = layout.row(align=True)
+        row0 = row.row()
+        row0.label(text="Filter:")
         
+        row1 = row.row(align=True)
+        row1.alignment = 'RIGHT'
+        row1.prop(self, "filter_mesh", text="", icon='MESH_DATA')
+        row1.prop(self, "filter_curve", text="", icon='CURVE_DATA')
+        row1.prop(self, "filter_surface", text="", icon='SURFACE_DATA')
+        row1.prop(self, "filter_meta", text="", icon='META_DATA')
+        row1.prop(self, "filter_font", text="", icon='FONT_DATA')
+        row1.prop(self, "filter_light", text="", icon='LIGHT_DATA')
+        if self.filter_collection:
+            row1.enabled = False
+        
+        row2 = row.row(align=False)
+        row2.alignment = 'RIGHT'
+        row2.prop(self, "filter_collection", text="", icon='GROUP')
+        
+        
+# Mesh settings to be used when baking attached objects
+class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
+    '''Mesh settings node'''
+    bl_label = 'Mesh'
+    bl_width_default = 240
+    
+    # Inputs are static on this node
     def update_inputs(self):
         pass
-    
+        
+    # Change inputs based on multi-res enabled
+    def update_multi_res(self, context):
+        self.inputs["Source"].hide = self.multi_res
+        self.inputs["Scene"].hide = self.multi_res
+        
+    # Determine if object meets current input filter
+    def input_filter(self, input_name, object):
+        if input_name == "Target":
+            if object.type == 'MESH':
+                return True
+        elif input_name == "Source":
+            if object.type in ['MESH', 'CURVE', 'SURFACE', 'META', 'FONT']:
+                return True
+        elif input_name == "Scene":
+            if object.rna_type.identifier == 'Collection':
+                return True
+        return False
+        
     # Check node settings are valid to bake. Returns true/false, plus error message.
     def validate(self, check_materials=False):
         valid = [True]
-        # Is a mesh selected?
-        if not self.mesh_object:
-            valid[0] = False
-            valid.append(_print("No valid mesh object selected", node=self, ret=True))
-        # Check for multires modifier if multires is enabled
-        if self.multi_res and self.mesh_object:
-            has_multi_mod = False
-            if len(self.mesh_object.modifiers):
-                for mod in self.mesh_object.modifiers:
-                    if mod.type == 'MULTIRES' and mod.total_levels > 0:
-                        has_multi_mod = True
-                        break
-            if not has_multi_mod:
-                valid[0] = False
-                valid.append(_print("Multires enabled but no multires data on selected mesh object", node=self, ret=True))
-        # Check cage if enabled
-        if self.cage:
-            if not self.cage_obj:
-                valid[0] = False
-                valid.append(_print("Cage enabled but no cage object selected", node=self, ret=True))
-            if self.mesh_object and self.cage_obj and len(self.mesh_object.data.polygons) != len(self.cage_obj.data.polygons):
-                    valid[0] = False
-                    valid.append(_print("Cage object face count does not match mesh object", node=self, ret=True))
-            if self.mesh_object and len(self.get_objects()) < 2:
-                valid[0] = False
-                valid.append(_print("Cage enabled but no high poly objects selected", node=self, ret=True))
-        # Check valid UV Map
-        if self.mesh_object and len(self.mesh_object.data.uv_layers) < 1:
-            valid[0] = False
-            valid.append(_print("Mesh object has no UV map(s)", node=self, ret=True))
-        if self.mesh_object and len(self.mesh_object.data.uv_layers) > 1 and self.uv_map and self.uv_map not in self.mesh_object.data.uv_layers:
-            valid[0] = False
-            valid.append(_print("Selected UV map not present on object (it could have been deleted or renamed)", node=self, ret=True))
-        # Validated?
-        if not valid[0]:
-            return valid
-        
-        # Valid, should materials also be checked?
-        if check_materials:
-            # Some bake types need to modify the materials, check if this can be done. A failure wont invalidate
-            # but warnings will be issued about the materails that fail.
-            mats = []
-            others = self.get_objects()
-            if self.multi_res or len(others) < 2:
-                # Just check self materials
-                if len(self.mesh_object.data.materials):
-                    for mat in self.mesh_object.data.materials:
-                        if mats.count(mat) == 0:
-                            mats.append(mat)
-            else:
-                # Just check not self materials
-                others.pop(0)
-                for obj in others:
-                    if len(obj.data.materials):
-                        for mat in obj.data.materials:
-                            if mats.count(mat) == 0:
-                                mats.append(mat)
-            
-            # Go through the list of materials and see if they will pass the prep phase
-            for mat in mats:
-                nodes = mat.node_tree.nodes
-                node_outputs = []
-                passed = False
+        # Check source objects
+        has_selected = False
+        if not self.multi_res:
+            has_selected = len(self.inputs["Source"].get_objects()) > 0
+        if has_selected and check_materials:
+            valid_selected = self.inputs["Source"].validate(check_materials)
+            # Add any generated messages to the stack. Material errors wont stop bake
+            if len(valid_selected) > 1:
+                valid_selected.pop(0)
+                valid += valid_selected
                 
-                # Not a node based material or not enough nodes to be valid
-                if not nodes or len(nodes) < 2:
-                    valid.append(_print("'%s' not node based or too few nodes" % (mat.name), node=self, ret=True))
-                    continue
-                
-                # Collect all outputs
-                for node in nodes:
-                    if node.type == 'OUTPUT_MATERIAL':
-                        if node.target == 'CYCLES' or node.target == 'ALL':
-                            node_outputs.append(node)
-                            
-                # Try to find at least one usable node pair from the outputs
-                for node in node_outputs:
-                    passed = material_recursor(node)
-                    if passed:
-                        break
-                
-                # Didn't find any usable node pairs
-                if not passed:
-                    valid.append(_print("'%s' Output doesn't appear to be a valid combination of Principled and Mix shaders. Baked values will not be correct for this material." % (mat.name), node=self, ret=True))
-                     
+        # Check target meshes
+        has_active = len(self.inputs["Target"].get_objects(True)) > 0
+        if has_active:
+            valid_active = self.inputs["Target"].validate(check_materials, True, self.multi_res)
+            valid[0] = valid_active.pop(0)
+            # Add any generated messages to the stack. Errors here will stop bake
+            if len(valid_active):
+                valid += valid_active
         return valid
-    
-    # Returns a list of all chosen mesh objects. The bake target will be at index 0, extra objects indicate
-    # a 'selected to active' type bake should be performed. May recurse through multiple prior nodes. If no
-    # mesh_object is set an empty list will be returned instead. Only unique objects will be returned.
-    def get_objects(self):
-        objects = []
-        if self.mesh_object:
-            objects.append(self.mesh_object)
-            if not self.inputs[0].is_linked:
-                if self.inputs[0].value and objects.count(self.inputs[0].value) == 0:
-                    objects.append(self.inputs[0].value)
-            else:
-                linked_objects = []
-                if self.inputs[0].links[0].is_valid and self.inputs[0].valid:
-                    linked_objects = self.inputs[0].links[0].from_node.get_objects()
-                if len(linked_objects):
-                    for obj in linked_objects:
-                        if objects.count(obj) == 0:
-                            objects.append(obj)
-        return objects
-    
-    # Filter for prop_search field used to select mesh_object
-    def mesh_object_filter(self, object):
-        return object.type == 'MESH'
-    
+        
+    # Return the requested set of objects from the appropriate input socket
+    def get_objects(self, set):
+        objs = []
+        count = []
+        dups = []
+        if set == 'TARGET':
+            objs = self.inputs["Target"].get_objects(True)
+        elif set == 'SOURCE':
+            objs = self.inputs["Source"].get_objects()
+        elif set == 'SCENE':
+            objs = self.inputs["Scene"].get_objects()      
+        # First remove duplicates
+        for obj in objs:
+            if objs.count(obj) > 1:
+                objs.remove(obj)
+        # Then remove non duplicate entries that reference the same object where appropriate
+        for obj in objs:
+            # Get a list of just the referenced objects to count them
+            count.append(obj[0])
+        for obj in count:
+            # Create a list of objects with multiple refs and count how many
+            if count.count(obj) > 1:
+                found = False
+                for dup in dups:
+                    if dup[0] == obj:
+                        found = True
+                        dup[1] += 1
+                        break
+                if not found:
+                    dups.append([obj, 1])
+        for obj in dups:
+            # Go over all the duplicate entries and prune appropriately
+            num = obj[1]
+            for dup in objs:
+                if dup[0] == obj[0]:
+                    # For target set, remove only dups that came from a group (the user may
+                    # want the same object with different settings)
+                    if set == 'TARGET':
+                        if len(dup) == 1:
+                            objs.remove(dup)
+                            num -= 1
+                    # For other sets just reduce to one reference
+                    else:
+                        objs.remove(dup)
+                        num -= 1
+                    # Break out when/if one dup remains
+                    if num == 1:
+                        break
+                
+        if _prefs('debug'):
+            _print("%s objects:" % (set))
+            for obj in objs:
+                _print(obj)
+                
+        # Return pruned object list
+        return objs
+        
     multi_res_passes = (
         ('NORMALS', "Normals", "Bake normals"),
-        ('DISPLACEMENT', "Displacment", "Bake displacement"),
+        ('DISPLACEMENT', "Displacement", "Bake displacement"),
     )
     
-    mesh_object: bpy.props.PointerProperty(name="Bake Target", description="Mesh that will be the active object during the bake", type=bpy.types.Object, poll=mesh_object_filter)
     ray_dist: bpy.props.FloatProperty(name="Ray Distance", description="Distance to use for inward ray cast when using a selected to active bake", default=0.01, step=1, min=0.0, unit='LENGTH')
     margin: bpy.props.IntProperty(name="Margin", description="Extends the baked result as a post process filter", default=0, min=0, subtype='PIXEL')
     mask_margin: bpy.props.IntProperty(name="Mask Margin", description="Adds extra padding to the mask bake. Use if edge details are being cut off", default=0, min=0, subtype='PIXEL')
-    multi_res: bpy.props.BoolProperty(name="Multires", description="Bake directly from multires object. This will disable or ignore the other bake settings.\nOnly Normals and Displacment can be baked")
+    multi_res: bpy.props.BoolProperty(name="Multires", description="Bake directly from multires object. This will disable or ignore the other bake settings.\nOnly Normals and Displacment can be baked", update=update_multi_res)
     multi_res_pass: bpy.props.EnumProperty(name="Pass", description="Choose shading information to bake into the image.\nMultires pass will override any connected bake pass", items=multi_res_passes, default='NORMALS')
-    cage: bpy.props.BoolProperty(name="Cage", description="Cast rays to active object from a cage. The cage must have the same number of faces")
-    cage_obj: bpy.props.PointerProperty(name="Cage Object", description="Object to use as a cage instead of calculating the cage from the active object", type=bpy.types.Object, poll=mesh_object_filter)
-    uv_map: bpy.props.StringProperty(name="UV Map", description="Pick map to bake if object has multiple layers. Leave blank to use active layer")
-    
+
     def init(self, context):
         # Sockets IN
-        self.inputs.new('BakeWrangler_Socket_HighPolyMesh', "Bake From")
+        self.inputs.new('BakeWrangler_Socket_Object', "Target")
+        self.inputs.new('BakeWrangler_Socket_Object', "Source")
+        self.inputs.new('BakeWrangler_Socket_Object', "Scene")
         # Sockets OUT
         self.outputs.new('BakeWrangler_Socket_Mesh', "Mesh")
-
+        
     def draw_buttons(self, context, layout):
-        layout.label(text="Mesh Object:")
-        layout.prop_search(self, "mesh_object", context.scene, "objects", text="")
         layout.prop(self, "margin", text="Margin")
         layout.prop(self, "mask_margin", text="Padding")
-        if self.mesh_object and len(self.mesh_object.data.uv_layers) > 1:
-            split = layout.split(factor=0.21)
-            split.label(text="UV:")
-            split.prop_search(self, "uv_map", self.mesh_object.data, "uv_layers", text="")
         layout.prop(self, "multi_res", text="From Multires")
         if not self.multi_res:
-            if not self.cage:
-                layout.prop(self, "cage", text="Cage")
-            else:
-                layout.prop(self, "cage", text="Cage:")
-                layout.prop_search(self, "cage_obj", context.scene, "objects", text="")
-            layout.label(text="Bake From:")
             layout.prop(self, "ray_dist", text="Ray Dist")
         else:
             layout.prop(self, "multi_res_pass")
         
-
+        
 # Baking node that holds all the settings for a type of bake 'pass'. Takes one or more mesh input nodes as input.
 class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     '''Baking pass node'''
-    bl_label = 'Bake Pass'
-    bl_width_default = 144
+    bl_label = 'Pass'
+    bl_width_default = 150
     
     # Returns the most identifing string for the node
     def get_name(self):
@@ -851,28 +971,46 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     def update_inputs(self):
         BakeWrangler_Tree_Node.update_inputs(self, 'BakeWrangler_Socket_Mesh', "Mesh")
         
+    # Update node label based on selected pass
+    def update_pass(self, context):
+        if self.label == "":
+            pass_label = ""
+            for pas in self.bake_passes:
+                if pas[0] == self.bake_pass:
+                    self.label = "Pass: " + pas[1]
+        elif ":" in self.label:
+            start, sep, end = self.label.rpartition(":")
+            for val in self.bake_passes:
+                if val[1] in end:
+                    pass_label = ""
+                    for pas in self.bake_passes:
+                        if pas[0] == self.bake_pass:
+                            pass_label = pas[1]
+                    end = end.replace(val[1], pass_label)
+                    self.label = start + sep + end
+                    break
+        
     # Check node settings are valid to bake. Returns true/false, plus error message(s).
     def validate(self, is_primary=False):
         valid = [True]
         # Validate inputs
         has_valid_input = False
         for input in self.inputs:
-            if input.is_linked and input.links[0].is_valid and input.valid:
+            if input.is_linked and input.valid:
                 if self.bake_pass in self.bake_pbr:
                     input_valid = input.links[0].from_node.validate(check_materials=True)
                 else:
                     input_valid = input.links[0].from_node.validate()
-                if not input_valid[0]:
-                    valid[0] = input_valid.pop(0)
-                    valid += input_valid
+                if not input_valid.pop(0):
+                    valid[0] = False
                 else:
-                    input_valid.pop(0)
-                    valid += input_valid
                     has_valid_input = True
+                if len(input_valid):
+                    valid += input_valid
         errs = len(valid)
         if not has_valid_input and errs < 2:
             valid[0] = False
-            valid.append(_print("Has no valid inputs connected", node=self, ret=True))
+            valid.append([_print("Input error", node=self, ret=True), ": No valid inputs connected"])
         # Validate outputs
         if is_primary:
             has_valid_output = False
@@ -881,27 +1019,27 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
                     for link in output.links:
                         if link.is_valid and link.to_socket.valid:
                             output_valid = link.to_node.validate()
-                            if not output_valid[0]:
-                                valid[0] = output_valid.pop(0)
-                                valid += output_valid
+                            if not output_valid.pop(0):
+                                valid[0] = False
                             else:
-                                output_valid.pop(0)
-                                valid += output_valid
                                 has_valid_output = True
+                            if len(output_valid):
+                                valid += output_valid
             if not has_valid_output and errs == len(valid):
                 valid[0] = False
-                valid.append(_print("Has no valid outputs connected", node=self, ret=True))
+                valid.append([_print("Output error", node=self, ret=True), ": No valid outputs connected"])
         # Validated
         return valid
     
     bake_passes = (
         ('ALBEDO', "Albedo", "Surface color without lighting (Principled shader only)"),
         ('METALLIC', "Metallic", "Surface 'metalness' values (Principled shader only)"),
+        ('SPECULAR', "Specular", "Surface specular values (Princpled shader only)"),
         ('ALPHA', "Alpha", "Surface transparency values (Principled shader only)"),
         
         ('NORMAL', "Normal", "Surface normals"),
-        ('CURVATURE', "Curvature", "Surface curvature map computed from tangent normals"),
         ('CURVE_SMOOTH', "Curvature (Smoothed)", "Curvature map with smoothing applied"),
+        ('CURVATURE', "Curvature", "Surface curvature map computed from tangent normals"),
         ('ROUGHNESS', "Roughness", "Surface roughness values"),
         ('AO', "Ambient Occlusion", "Surface self occlusion values"),
         ('CAVITY', "Cavity", "Surface cavity occlusion map"),
@@ -918,7 +1056,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     )
     
     bake_built_in = ['NORMAL', 'ROUGHNESS', 'AO', 'SUBSURFACE', 'TRANSMISSION', 'GLOSSY', 'DIFFUSE', 'ENVIRONMENT', 'EMIT', 'UV', 'SHADOW', 'COMBINED']
-    bake_pbr = ['ALBEDO', 'METALLIC', 'ALPHA', 'CAVITY']
+    bake_pbr = ['ALBEDO', 'METALLIC', 'ALPHA', 'CAVITY', 'SPECULAR']
     bake_has_influence = ['SUBSURFACE', 'TRANSMISSION', 'GLOSSY', 'DIFFUSE', 'COMBINED']
     
     normal_spaces = (
@@ -940,7 +1078,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         ('GPU', "GPU", "Use GPU for baking"),
     )
 
-    bake_pass: bpy.props.EnumProperty(name="Pass", description="Type of pass to bake", items=bake_passes, default='NORMAL')
+    bake_pass: bpy.props.EnumProperty(name="Pass", description="Type of pass to bake", items=bake_passes, default='NORMAL', update=update_pass)
     bake_samples: bpy.props.IntProperty(name="Bake Samples", description="Number of samples to bake for each pixel. Use 25 to 50 samples for most bake types (AO may look better with more).\nQuality is gained by increaseing resolution rather than samples past that point", default=32, min=1)
     bake_xres: bpy.props.IntProperty(name="Bake X resolution", description="Number of horizontal pixels in bake. Power of 2 image sizes are recommended for exporting", default=1024, min=1, subtype='PIXEL')
     bake_yres: bpy.props.IntProperty(name="Bake Y resolution", description="Number of vertical pixels in bake. Power of 2 image sizes are recommended for exporting", default=1024, min=1, subtype='PIXEL')
@@ -962,6 +1100,10 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     curve_px: bpy.props.IntProperty(name="Curve Pixel Width", description="Curvature edge pixel width", default=1)
     
     def init(self, context):
+        # Set label to pass
+        for pas in self.bake_passes:
+            if pas[0] == self.bake_pass:
+                self.label = "Pass: " + pas[1]
         # Sockets IN
         self.inputs.new('BakeWrangler_Socket_Mesh', "Mesh")
         # Sockets OUT
@@ -1030,7 +1172,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
 class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     '''Output image path node'''
     bl_label = 'Output Image Path'
-    bl_width_default = 152
+    bl_width_default = 157
     
     # Returns the most identifing string for the node
     def get_name(self):
@@ -1048,7 +1190,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         # Validate inputs
         has_valid_input = False
         for input in self.inputs:
-            if input.is_linked and input.links[0].is_valid and input.valid:
+            if input.is_linked and input.valid:
                 if not is_primary:
                     has_valid_input = True
                     break
@@ -1061,11 +1203,11 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         errs = len(valid)
         if not has_valid_input and errs < 2:
             valid[0] = False
-            valid.append(_print("Has no valid inputs connected", node=self, ret=True))
+            valid.append([_print("Input error", node=self, ret=True), ": No valid inputs connected"])
         # Validate file path
         if not os.path.isdir(os.path.abspath(self.img_path)):
             valid[0] = False
-            valid.append(_print("Invalid path '%s'" % (os.path.abspath(self.img_path)), node=self, ret=True))
+            valid.append([_print("Path error", node=self, ret=True), ": Invalid path '%s'" % (os.path.abspath(self.img_path))])
         # Check if there is read/write access to the file/directory
         file_path = os.path.join(os.path.abspath(self.img_path), self.img_name)
         if os.path.exists(file_path):
@@ -1075,26 +1217,26 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
                     file = open(file_path, "a")
                 except OSError as err:
                     valid[0] = False
-                    valid.append(_print("Error trying to open file at '%s'" % (err.strerror), node=self, ret=True))
+                    valid.append([_print("File error", node=self, ret=True), ": Trying to open file at '%s'" % (err.strerror)])
                 else:
                     # See if it can be read as an image
                     file.close()
                     file_img = bpy.data.images.load(file_path)
                     if not len(file_img.pixels):
                         valid[0] = False
-                        valid.append(_print("File exists but doesn't seem to be a known image format", node=self, ret=True))
+                        valid.append([_print("File error", node=self, ret=True), ": File exists but doesn't seem to be a known image format"])
                     bpy.data.images.remove(file_img)
             else:
                 # It exists but isn't a file
                 valid[0] = False
-                valid.append(_print("File exists but isn't a regular file at '%s'" % (file_path), node=self, ret=True))
+                valid.append([_print("File error", node=self, ret=True), ": File exists but isn't a regular file '%s'" % (file_path)])
         else:
             # See if it can be created
             try:
                 file = open(file_path, "a")
             except OSError as err:
                 valid[0] = False
-                valid.append(_print("%s trying to create file at '%s'" % (err.strerror, file_path), node=self, ret=True))
+                valid.append([_print("File error", node=self, ret=True), ": %s trying to create file at '%s'" % (err.strerror, file_path)])
             else:
                 file.close()
                 os.remove(file_path)
@@ -1402,7 +1544,7 @@ class BakeWrangler_Output_Batch_Bake(Node, BakeWrangler_Tree_Node):
         errs = len(valid)
         if not has_valid_input and errs < 2:
             valid[0] = False
-            valid.append(_print("Has no valid inputs connected", node=self, ret=True))
+            valid.append([_print("Input error", node=self, ret=True), ": No valid inputs connected"])
         # Everything validated
         return valid
 
@@ -1430,14 +1572,10 @@ class BakeWrangler_Node_Category(NodeCategory):
 
 # List of all bakery nodes put into categories with identifier, name
 BakeWrangler_Node_Categories = [
-    BakeWrangler_Node_Category('Inputs', "Inputs", items=[
-        NodeItem("BakeWrangler_Input_HighPolyMesh"),
-        NodeItem("BakeWrangler_Input_Mesh"),
-    ]),
-    BakeWrangler_Node_Category('Baking', "Baking", items=[
+    BakeWrangler_Node_Category('BakeWrangler_Nodes', "Bake Wrangler", items=[
+        NodeItem("BakeWrangler_Input_ObjectList"),
+        NodeItem("BakeWrangler_Bake_Mesh"),
         NodeItem("BakeWrangler_Bake_Pass"),
-    ]),
-    BakeWrangler_Node_Category('Outputs', "Outputs", items=[
         NodeItem("BakeWrangler_Output_Image_Path"),
         NodeItem("BakeWrangler_Output_Batch_Bake"),
     ]),
@@ -1455,13 +1593,13 @@ classes = (
     BakeWrangler_Operator_BakeStop,
     BakeWrangler_Operator_BakePass,
     BakeWrangler_Tree,
-    BakeWrangler_Socket_HighPolyMesh,
+    BakeWrangler_Socket_Object,
     BakeWrangler_Socket_Mesh,
     BakeWrangler_Socket_Color,
     BakeWrangler_Socket_Float,
     BakeWrangler_Socket_Bake,
-    BakeWrangler_Input_HighPolyMesh,
-    BakeWrangler_Input_Mesh,
+    BakeWrangler_Input_ObjectList,
+    BakeWrangler_Bake_Mesh,
     BakeWrangler_Bake_Pass,
     BakeWrangler_Output_Image_Path,
     BakeWrangler_Output_Batch_Bake,
@@ -1469,12 +1607,12 @@ classes = (
 
 
 # Use a handler on depsgraph update to detect creation of new trees and switching to
-# the bake tree edititor - Because I can't really see a better way to get the desired
-# behaviour: New trees need a dummy user so they don't get deleted, new trees should
+# the bake tree editor - Because I can't really see a better way to get the desired
+# behavior: New trees need a dummy user so they don't get deleted, new trees should
 # get a better name than 'node tree' and switching to the editor should load the last
 # active tree up instead of nothing.
 from bpy.app.handlers import persistent
-post_hook_index = -1
+post_hook_index = -1                   
 @persistent
 def BakeWranger_Hook_Post_NewTree(dummy):
     debug = _prefs('debug')
@@ -1483,9 +1621,11 @@ def BakeWranger_Hook_Post_NewTree(dummy):
         if debug: _print("Starting post depsgraph update")
         if len(ctx.area.spaces) > 0 and hasattr(ctx.area.spaces[0], 'node_tree'):
             tree = ctx.area.spaces[0].node_tree
+            # Init a new tree
             if tree and not tree.initialised:
-                if debug: _print("New/Uninitialised node tree active")
+                if debug: _print("New/Uninitialized node tree active")
                 tree.use_fake_user = True
+                # Give tree a nice name
                 if tree.name.startswith("NodeTree"):
                     num = 0
                     for nodes in bpy.data.node_groups:
@@ -1501,8 +1641,130 @@ def BakeWranger_Hook_Post_NewTree(dummy):
                         if debug: _print("Next highest name number selected '%d'" % (num))
                         name = "Bake Recipe.%03d" % (num)
                     tree.name = tree.name.replace("NodeTree", name, 1)
+                # Add initial basic node set up
+                if len(tree.nodes) == 0:
+                    bake_mesh = tree.nodes.new('BakeWrangler_Bake_Mesh')
+                    bake_pass = tree.nodes.new('BakeWrangler_Bake_Pass')
+                    output_img = tree.nodes.new('BakeWrangler_Output_Image_Path')
+                    
+                    bake_mesh.location[0] -= 300
+                    output_img.location[0] += 200
+                    
+                    tree.links.new(bake_pass.inputs[0], bake_mesh.outputs[0])
+                    tree.links.new(output_img.inputs[0], bake_pass.outputs[0])
+                    tree.tree_version = BW_TREE_VERSION
                 tree.initialised = True
-                if debug: _print("Tree initialised")
+                if debug: _print("Tree initialized")
+            # Update an out of date tree
+            if tree and tree.tree_version < BW_TREE_VERSION:
+                if debug: _print("Tree out of date (tree: v%i current: v%i)" % (tree.tree_version, BW_TREE_VERSION))
+                # Version zero or one tree to version 2 tree
+                if tree.tree_version in [0, 1]:
+                    # Import old tree classes
+                    from . import node_tree_v1
+                    node_tree_v1.register()
+                    if debug: _print("Loaded node_tree_v1")
+                    if debug: _print("Updating to: v2")
+                    # Replace superseded nodes with updated variants
+                    for node in list(tree.nodes):
+                        id = BakeWranger_Hook_RNA_Repair(node)
+                        # Input_Mesh's must be replaced with Bake_Mesh's
+                        if id == 'BakeWrangler_Input_Mesh':
+                            replace = tree.nodes.new('BakeWrangler_Bake_Mesh')
+                            replace.width = node.width
+                            replace.location = node.location
+                            # Re-create links to replacement node (these only had one input and output)
+                            if node.inputs[0].is_linked:
+                                tree.links.new(replace.inputs['Source'], node.inputs[0].links[0].from_socket)
+                            if node.outputs[0].is_linked:
+                                # Output could still be linked to multiple things
+                                for link in node.outputs[0].links:
+                                    tree.links.new(link.to_socket, replace.outputs[0])
+                            # Copy settings that are common in replacement
+                            if node.mesh_object:
+                                active_obj = replace.inputs['Target']
+                                active_obj.value = node.mesh_object
+                                if node.cage:
+                                    active_obj.use_cage = True
+                                if node.cage_obj:
+                                    active_obj.cage = node.cage_obj
+                                if node.uv_map:
+                                    active_obj.pick_uv = True
+                                    active_obj.uv_map = node.uv_map
+                            replace.ray_dist = node.ray_dist
+                            replace.margin = node.margin
+                            replace.mask_margin = node.mask_margin
+                            replace.multi_res = node.multi_res
+                            replace.multi_res_pass = node.multi_res_pass
+                            # Delete old node
+                            tree.nodes.remove(node)
+                        # HighPolyMesh nodes are replaced by ObjectList nodes
+                        if id == 'BakeWrangler_Input_HighPolyMesh':
+                            replace = tree.nodes.new('BakeWrangler_Input_ObjectList')
+                            replace.width = node.width
+                            replace.location = node.location
+                            # Recreate input links or copy values
+                            for input in node.inputs:
+                                sock = replace.inputs[-1]
+                                if input.is_linked:
+                                    tree.links.new(sock, input.links[0].from_socket)
+                                elif input.value:
+                                    sock.value = input.value
+                                    if input.collection and input.recursive:
+                                        sock.recursive = True
+                            # Recreate output links
+                            if node.outputs[0].is_linked:
+                                for link in node.outputs[0].links:
+                                    tree.links.new(link.to_socket, replace.outputs[0])
+                            # Delete old node
+                            tree.nodes.remove(node)
+                    # Unregister old classes
+                    node_tree_v1.unregister()
+                    del node_tree_v1
+                    # Fix version number
+                    tree.tree_version = 2
+                # Update from v2 to v3
+                if tree.tree_version == 2:
+                    # Replace superseded nodes with updated variants
+                    for node in list(tree.nodes):
+                        id = BakeWranger_Hook_RNA_Repair(node)
+                        # Bake_Mesh has renamed inputs that require replacing old ones
+                        if id == 'BakeWrangler_Bake_Mesh':
+                            # Active becomes Target
+                            target = node.inputs.new("BakeWrangler_Socket_Object", "Target")
+                            active = node.inputs[0]
+                            if active.is_linked:
+                                tree.links.new(target, active.links[0].from_socket)
+                            if active.value:
+                                target.value = active.value
+                            # Selected becomes Source
+                            source = node.inputs.new("BakeWrangler_Socket_Object", "Source")
+                            select = node.inputs[1]
+                            if select.is_linked:
+                                tree.links.new(source, select.links[0].from_socket)
+                            if select.value:
+                                source.value = select.value
+                            # Remove the old sockets and fix positions
+                            node.inputs.remove(active)
+                            node.inputs.remove(select)
+                            node.inputs.move(0, 2)
+                        # Pass label should be set to the pass name if currently empty
+                        if id == 'BakeWrangler_Bake_Pass':
+                            if node.label == "":
+                                for pas in node.bake_passes:
+                                    if pas[0] == node.bake_pass:
+                                        node.label = "Pass: " + pas[1]
+                                        break
+                                        
+
+
+# RNA repair looper (sometimes an error happens, but retrying fixes it?)
+def BakeWranger_Hook_RNA_Repair(object):
+    try:
+        return object.bl_idname
+    except:
+        _print("RNA Fail")
+        BakeWranger_Hook_RNA_Repair(object)
 
 
 
@@ -1519,6 +1781,7 @@ def register():
 
 
 def unregister():
+    # Probably shouldn't try to do this...
     if post_hook_index <= (len(bpy.app.handlers.depsgraph_update_post) + 1):
         bpy.app.handlers.depsgraph_update_post.pop(post_hook_index)
         

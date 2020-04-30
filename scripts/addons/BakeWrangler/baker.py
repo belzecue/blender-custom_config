@@ -16,6 +16,16 @@ except:
 
 # Process the node tree with the given node as the starting point
 def process_tree(tree_name, node_name):
+    # Create a base scene to work from that has every object in it
+    global base_scene
+    base_scene = bpy.data.scenes.new("BakeWrangler_Base")
+    bpy.context.window.scene = base_scene
+    for obj in bpy.data.objects:
+        base_scene.collection.objects.link(obj)
+    # Add a property on objects that can link to a copy made
+    bpy.types.Object.bw_copy = bpy.props.PointerProperty(name="Object Copy", description="Copy with some data not applied", type=bpy.types.Object)
+    
+    # Get tree position
     tree = bpy.data.node_groups[tree_name]
     node = tree.nodes[node_name]
     err = False
@@ -76,18 +86,79 @@ def process_tree(tree_name, node_name):
             err += process_bake_pass_output(bake_pass, img_bake, img_mask)
             if bake_pass != req_passes[-1]:
                 _print(">", tag=True)
-
+                
     return err
 
 
 
+# Pretty much everything here is about preventing blender crashing or failing in some way that only happens
+# when it runs a background bake. Perhaps it wont be needed some day, but for now trying to keep all such
+# things in one place. Modifiers are applied or removed and non mesh types are converted.
+def prep_objects_for_bake(object, bake_strategy):
+    # Make obj the only selected + active
+    bpy.ops.object.select_all(action='DESELECT')
+    object.select_set(True)
+    bpy.context.view_layer.objects.active = object
+    
+    # Deal with mods
+    if len(object.modifiers):
+        has_multires = False
+        for mod in object.modifiers:
+            # Handle mulires differently
+            if mod.type == 'MULTIRES' and mod.show_render:
+                has_multires = True
+                continue
+            if mod.show_render:
+                # A mod can be disabled by invalid settings, which will throw an exception when trying to apply it
+                try:
+                    bpy.ops.object.modifier_apply(modifier=mod.name)
+                except:
+                    _print(">    Error applying modifier '%s' to object '%s'" % (mod.name, object.name), tag=True) 
+                    bpy.ops.object.modifier_remove(modifier=mod.name)
+            else:
+                bpy.ops.object.modifier_remove(modifier=mod.name)
+        # Need to make a copy with multires mod intact
+        if has_multires:
+            copy = object.copy()
+            copy.data = object.data.copy()
+            copy.name = "BW_" + object.name
+            object.bw_copy = copy
+            base_scene.collection.objects.link(copy)
+            # Now apply the multires mods
+            for mod in object.modifiers:
+                if mod.show_render:
+                    # A mod can be disabled by invalid settings, which will throw an exception when trying to apply it
+                    try:
+                        bpy.ops.object.modifier_apply(modifier=mod.name)
+                    except:
+                        _print(">    Error applying modifier '%s' to object '%s'" % (mod.name, object.name), tag=True) 
+                        bpy.ops.object.modifier_remove(modifier=mod.name)
+                else:
+                    bpy.ops.object.modifier_remove(modifier=mod.name)
+            
+    # Deal with object type
+    if object.type != 'MESH':
+        # Apply render resolution if its set before turning into a mesh
+        if object.type == 'META':
+            if object.data.render_resolution > 0:
+                object.data.resolution = object.data.render_resolution
+        else:
+            if object.data.render_resolution_u > 0:
+                object.data.resolution_u = object.data.render_resolution_u
+            if object.data.render_resolution_v > 0:
+                object.data.resolution_v = object.data.render_resolution_v
+        # Convert
+        bpy.ops.object.convert(target='MESH')
+            
+            
+    
 # Takes a bake pass node and returns the baked image and baked mask
 def process_bake_pass_input(node):
     pass_start = datetime.now()
     err = False
     
     # Gather pass settings
-    meshes = []
+    bake_mesh = []
     img_bake = None
     img_mask = None
     bake_dev = node.bake_device
@@ -138,15 +209,14 @@ def process_bake_pass_input(node):
             if comb_emit:
                 pass_influences.add('EMIT')
                 
-    # Gather unique input meshes
+    # Get bake mesh inputs
     inputs = node.inputs
     for input in inputs:
-        if input.is_linked:
-            link = input.links[0]
-            if link.is_valid and link.to_socket.valid and not meshes.count(link.from_node):
-                meshes.append(link.from_node)
+        if input.is_linked and input.valid:
+            if not bake_mesh.count(input.links[0].from_node):
+                bake_mesh.append(input.links[0].from_node)
     
-    _print(">  Input Meshes: %i" % (len(meshes)), tag=True)
+    _print(">  Bake Mesh: %i" % (len(bake_mesh)), tag=True)
     
     # Generate the bake and mask images
     img_bake = bpy.data.images.new(node.get_name(), width=x_res, height=y_res)
@@ -155,290 +225,298 @@ def process_bake_pass_input(node):
     img_bake.colorspace_settings.is_data = True
     if bake_type in ['NORMAL', 'CURVATURE', 'CURVE_SMOOTH']:
         img_bake.generated_color = (0.5, 0.5, 1.0, 1.0)
+    img_bake.use_generated_float = True
                 
     img_mask = bpy.data.images.new("mask_" + node.get_name(), width=x_res, height=y_res)
     img_mask.alpha_mode = 'NONE'
     img_mask.colorspace_settings.name = 'Non-Color'
     img_mask.colorspace_settings.is_data = True
     
-    # Begin processing input meshes
-    for mesh in meshes:
-        _print(">   %i/%i: [%s]" % ((meshes.index(mesh) + 1), len(meshes), mesh.get_name()), tag=True)
+    # Begin processing bake meshes
+    for mesh in bake_mesh:
+        active_meshes = mesh.get_objects('TARGET')
+        selected_objs = mesh.get_objects('SOURCE')
+        scene_objs = mesh.get_objects('SCENE')
+        
+        _print(">   %i/%i: [%s] with %i active meshes" % ((bake_mesh.index(mesh) + 1), len(bake_mesh), mesh.get_name(), len(active_meshes)), tag=True)
         # Gather settings for this mesh. Validation should have been done before this script was ever run
         # so all settings will be assumed valid.
-        objects = mesh.get_objects()
-        target = objects.pop(0)
         margin = mesh.margin
         padding = mesh.mask_margin
         multi = mesh.multi_res
         multi_pass = mesh.multi_res_pass
-        cage = mesh.cage
-        cage_obj = mesh.cage_obj
-        cage_cpy = None
-        cage_obj_name = ""
         ray_dist = mesh.ray_dist
-        to_active = len(objects) > 0
-        if cage:
-            cage_cpy = cage_obj.copy()
-            cage_cpy.data = cage_obj.data.copy()
-            cage_obj_name = cage_cpy.name
-        if len(target.data.uv_layers) > 1 and mesh.uv_map:
-            uv_name = mesh.uv_map
-        else:
-            uv_name = None
         
-        # Load in template bake scene with mostly optimised settings for baking
-        bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
-        with bpy.data.libraries.load(bake_scene_path, link=False, relative=False) as (file_from, file_to):
-            file_to.scenes.append("BakeWrangler")
-        bake_scene = file_to.scenes[0]
-        # Set the cycles values that aren't saved in the template and give it a name that can be traced
-        bake_scene.cycles.device = bake_dev
-        bake_scene.cycles.samples = bake_samp
-        bake_scene.cycles.aa_samples = bake_samp
-        bake_scene.name = "bake_" + node.get_name() + "_" + mesh.get_name()
-        
-        # Firstly there are two main catagories of bake. Either the bake is of some data that blender can calculate
-        # (normals, roughness, etc) or it is of some property of the material (albedo, metalness, etc). The first set
-        # don't require any changes to be made to materials, while the second set do.
-        # Then there are three posibilities for where to get the data. For a single object, the data comes from its
-        # own materials. A sub case of this is using a multires modifier to get some data (normals). Finally many
-        # objects can be mapped to the surface of the target, in which case the materials on the target don't matter,
-        # but the materials on everything else does.
-        
-        # Regardless of strategy the following data will be used. Copies are made so other passes can get the originals
-        target_cpy = target.copy()
-        target_cpy.data = target.data.copy()
-        bake_scene.collection.objects.link(target_cpy)
-        
-        # Set UV map to use if one was selected
-        if uv_name:
-            target_cpy.data.uv_layers.active = target_cpy.data.uv_layers[uv_name]
-        
-        # Determine what strategy to use for this bake and set up the data for it
-        bake_strategy = ''
-        if multi == True:
-            bake_strategy = 'MULTI'
-            cage = False
-            to_active = False
-        elif to_active:
-            bake_strategy = 'TOACT'
-            # To active needs a copy of all the objects, not just target
-            object_cpys = []
-            for obj in objects:
-                copy = obj.copy()
-                copy.data = obj.data.copy()
-                object_cpys.append(copy)
-                bake_scene.collection.objects.link(copy)
-            # Materials should be removed from the target copy for To active
-            target_cpy.data.materials.clear()
-            target_cpy.data.polygons.foreach_set('material_index', [0] * len(target_cpy.data.polygons))
-            target_cpy.data.update()
-            # Add the cage copy to the scene because it doesn't work properly in a different scene currently
-            if cage:
-                bake_scene.collection.objects.link(cage_cpy)
-        else:
-            bake_strategy = 'SOLO'
-            cage = False
-            to_active = False
-                
-        # Switch into bake scene
-        prev_scene = bpy.context.window.scene
-        prev_layer = bpy.context.view_layer
-        bpy.context.window.scene = bake_scene
-        # Trick to make the view layer stay the same on switching back maybe?
-        bpy.context.view_layer.name = prev_layer.name
-        
-        # Apply or remove all modifiers depending on their render settings as mods are causing crashes in some cases
-        for obj in bpy.context.window.scene.objects:
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.context.view_layer.objects.active = obj
-            if len(obj.modifiers):
-                for mod in obj.modifiers:
-                    # Don't get rid of multires mods if they are the target to bake
-                    if bake_strategy == 'MULTI' and mod.type == 'MULTIRES' and mod.show_render:
-                        continue
-                    if mod.show_render:
-                        # A mod can be disabled by invalid settings, which will throw an exception when trying to apply it
-                        try:
-                            bpy.ops.object.modifier_apply(modifier=mod.name)
-                        except:
-                            bpy.ops.object.modifier_remove(modifier=mod.name)
-                    else:
-                        bpy.ops.object.modifier_remove(modifier=mod.name)
+        # Process each active mesh
+        for active in active_meshes:
+            # Load in template bake scene with mostly optimized settings for baking
+            bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
+            with bpy.data.libraries.load(bake_scene_path, link=False, relative=False) as (file_from, file_to):
+                file_to.scenes.append("BakeWrangler")
+            bake_scene = file_to.scenes[0]
+            # Set the cycles values that aren't saved in the template and give it a name that can be traced
+            bake_scene.cycles.device = bake_dev
+            bake_scene.cycles.samples = bake_samp
+            bake_scene.cycles.aa_samples = bake_samp
+            bake_scene.name = "bake_" + node.get_name() + "_" + mesh.get_name() + "_" + active[0].name
             
-        # Select the target and make it active
-        bpy.ops.object.select_all(action='DESELECT')
-        target_cpy.select_set(True)
-        bpy.context.view_layer.objects.active = target_cpy
-        
-        # Make single user copies of all materials still in play. Even if they wont be changed by this bake.
-        bpy.ops.object.select_all(action='SELECT')
-        # De-select the cage if its in use
-        if cage:
-            cage_cpy.select_set(False)
-        bpy.ops.object.make_single_user(type='SELECTED_OBJECTS', object=False, obdata=False, material=True, animation=False)
-        
-        # Collect a list of all the materials, making sure each is only added once
-        unique_mats = []
-        if bake_strategy == 'TOACT':
-            # Get materials from all the objects except the target
-            for obj in object_cpys:
-                has_mat = False
-                if bake_type == 'CAVITY' and len(obj.material_slots):
-                    for slot in obj.material_slots:
-                        # Replace texture with cavity shader
-                        if slot.material != None:
-                            slot.material = cavity_shader
-                if len(obj.data.materials):
-                    for mat in obj.data.materials:
-                        # Slots can be empty
-                        if mat != None:
-                            has_mat = True
-                            if unique_mats.count(mat) == 0:
-                                unique_mats.append(mat)
-                if not has_mat:
-                    # If the object has no materials, one needs to be added for the mask baking step or for cavity map
-                    if bake_type == 'CAVITY':
-                        mat = cavity_shader
-                    else:
-                        mat = bpy.data.materials.new(name="mask_" + obj.name)
-                        mat.use_nodes = True
-                    obj.data.materials.append(mat)
-                    if unique_mats.count(mat) == 0:
-                        unique_mats.append(mat)
-        else:
-            # Get materials from only the target and add cavity shader if needed
-            if bake_type == 'CAVITY':
-                if len(target_cpy.material_slots):
-                    for slot in target_cpy.material_slots:
-                        # Replace texture with cavity shader
-                        if slot.material != None:
-                            slot.material = cavity_shader
+            # Firstly there are two main categories of bake. Either the bake is of some data that blender can calculate
+            # (normals, roughness, etc) or it is of some property of the material (albedo, metalness, etc). The first set
+            # don't require any changes to be made to materials, while the second set do.
+            # Then there are three possibilities for where to get the data. For a single object, the data comes from its
+            # own materials. A sub case of this is using a multires modifier to get some data (normals). Finally many
+            # objects can be mapped to the surface of the target, in which case the materials on the target don't matter,
+            # but the materials on everything else does.
+            
+            cage = False
+            cage_object = None
+            cage_obj_name = ""
+            to_active = False
+            
+            # Determine what strategy to use for this bake and set up the data for it
+            bake_strategy = ''
+            if multi == True:
+                bake_strategy = 'MULTI'
+            else:
+                select_check = False
+                for obj in selected_objs:
+                    if obj[0] != active[0]:
+                        select_check = True
+                if select_check:
+                    bake_strategy = 'TOACT'
+                    to_active = True
                 else:
-                    target_cpy.data.materials.append(cavity_shader)
-            if len(target_cpy.data.materials):
-                for mat in target_cpy.data.materials:
-                    # Slots can be empty
-                    if mat != None:
+                    bake_strategy = 'SOLO'
+                
+            # Regardless of strategy the following data will be used. Copies are made so other passes can get the originals
+            prep_objects_for_bake(active[0], bake_strategy)
+            act = active[0]
+            if multi:
+                act = active[0].bw_copy
+            target = act.copy()
+            target.data = act.data.copy()
+            bake_scene.collection.objects.link(target)
+            
+            # Copy all scene objects over if not a multi-res pass
+            if not multi:
+                scene = bpy.data.collections.new("Scene_" + active[0].name)
+                for obj in scene_objs:
+                    copy = obj[0].copy()
+                    copy.data = obj[0].data.copy()
+                    scene.objects.link(copy)
+                bake_scene.collection.children.link(scene)
+            
+            # Set UV map to use if one was selected
+            if len(active) > 1 and active[1] not in [None, ""]:
+                target.data.uv_layers.active = target.data.uv_layers[active[1]]
+            
+            # Copy all selected objects over if 'to active' pass
+            if to_active:
+                selected = bpy.data.collections.new("Selected_" + active[0].name)
+                for obj in selected_objs:
+                    if obj[0] != active[0]:
+                        prep_objects_for_bake(obj[0], bake_strategy)
+                        copy = obj[0].copy()
+                        copy.data = obj[0].data.copy()
+                        selected.objects.link(copy)
+                bake_scene.collection.children.link(selected)
+                # Materials should be removed from the target copy for To active
+                target.data.materials.clear()
+                target.data.polygons.foreach_set('material_index', [0] * len(target.data.polygons))
+                target.data.update()
+                # Add the cage copy to the scene because it doesn't work properly in a different scene currently
+                if len(active) > 2 and active[2]:
+                    cage = True
+                    prep_objects_for_bake(active[2], bake_strategy)
+                    cage_object = active[2].copy()
+                    cage_object.data = active[2].data.copy()
+                    bake_scene.collection.objects.link(cage_object)
+                    cage_obj_name = cage_object.name
+                    
+            # Switch into bake scene
+            bpy.context.window.scene = bake_scene
+                
+            # Select the target and make it active
+            bpy.ops.object.select_all(action='DESELECT')
+            target.select_set(True)
+            bpy.context.view_layer.objects.active = target
+            
+            # Make single user copies of all materials still in play
+            bpy.ops.object.select_all(action='SELECT')
+            
+            # De-select the cage if its in use
+            if cage:
+                cage_object.select_set(False)
+                
+            # De-select scene only items
+            for obj in scene.objects:
+                obj.select_set(False)
+            bpy.ops.object.make_single_user(type='SELECTED_OBJECTS', object=False, obdata=False, material=True, animation=False)
+            
+            # Collect a list of all the materials, making sure each is only added once
+            unique_mats = []
+            if bake_strategy == 'TOACT':
+                # Get materials from all the objects except the target
+                for obj in selected.objects:
+                    has_mat = False
+                    if bake_type == 'CAVITY' and len(obj.material_slots):
+                        for slot in obj.material_slots:
+                            # Replace texture with cavity shader
+                            if slot.material != None:
+                                slot.material = cavity_shader
+                    if len(obj.data.materials):
+                        for mat in obj.data.materials:
+                            # Slots can be empty
+                            if mat != None:
+                                has_mat = True
+                                if unique_mats.count(mat) == 0:
+                                    unique_mats.append(mat)
+                    if not has_mat:
+                        # If the object has no materials, one needs to be added for the mask baking step or for cavity map
+                        if bake_type == 'CAVITY':
+                            mat = cavity_shader
+                        else:
+                            mat = bpy.data.materials.new(name="mask_" + obj.name)
+                            mat.use_nodes = True
+                        obj.data.materials.append(mat)
                         if unique_mats.count(mat) == 0:
                             unique_mats.append(mat)
-                                
-        # Add simple image node material to target object for To active bake or if it doesn't have a material
-        if bake_strategy == 'TOACT' or len(target_cpy.data.materials) < 1:
-            mat = bpy.data.materials.new(name="mat_" + node.get_name() + "_" + mesh.get_name())
-            mat.use_nodes = True
-            image_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
-            image_node.image = img_bake
-            image_node.select = True
-            mat.node_tree.nodes.active = image_node
-            target_cpy.data.materials.append(mat)
-        
-        # Prepare the materials for the bake type
-        for mat in unique_mats:
-            if debug: _print(">    Preparing material [%s] for [%s] bake" % (mat.name, bake_type), tag=True)
-            prep_material_for_bake(node, mat.node_tree, bake_type)
-            
-            if bake_strategy != 'TOACT':
-                # For non To active bakes, add an image node to the material and make it selected + active for bake image
+            else:
+                # Get materials from only the target and add cavity shader if needed
+                if bake_type == 'CAVITY':
+                    if len(target.material_slots):
+                        for slot in target.material_slots:
+                            # Replace texture with cavity shader
+                            if slot.material != None:
+                                slot.material = cavity_shader
+                    else:
+                        target.data.materials.append(cavity_shader)
+                if len(target.data.materials):
+                    for mat in target.data.materials:
+                        # Slots can be empty
+                        if mat != None:
+                            if unique_mats.count(mat) == 0:
+                                unique_mats.append(mat)
+                                    
+            # Add simple image node material to target object for To active bake or if it doesn't have a material
+            if bake_strategy == 'TOACT' or len(target.data.materials) < 1:
+                mat = bpy.data.materials.new(name="mat_" + node.get_name() + "_" + mesh.get_name())
+                mat.use_nodes = True
                 image_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
                 image_node.image = img_bake
                 image_node.select = True
                 mat.node_tree.nodes.active = image_node
-        
-        # Set 'real' bake pass. PBR use EMIT rather than the named pass, since those passes don't exist.
-        if bake_type in node.bake_pbr:
-            real_bake_type = 'EMIT'
-        elif bake_type in ['CURVATURE', 'CURVE_SMOOTH']:
-            real_bake_type = 'NORMAL'
-            norm_s = 'TANGENT'
-            norm_r = 'POS_X'
-            norm_g = 'POS_Y'
-            norm_b = 'POS_Z'
-        else:
-            real_bake_type = bake_type
+                target.data.materials.append(mat)
             
-        if debug: _print(">     Real bake type set to [%s]" % (real_bake_type), tag=True)
-            
-        start = datetime.now()
-        _print(">    -Baking %s pass: " % (bake_type), tag=True, wrap=False)
-        
-        # Do the bake. Most of the properties can be passed as arguments to the operator.
-        try:
-            if bake_strategy != 'MULTI':
-                bpy.ops.object.bake(
-                    type=real_bake_type,
-                    pass_filter=pass_influences,
-                    margin=margin,
-                    use_selected_to_active=to_active,
-                    cage_extrusion=ray_dist,
-                    cage_object=cage_obj_name,
-                    normal_space=norm_s,
-                    normal_r=norm_r,
-                    normal_g=norm_g,
-                    normal_b=norm_b,
-                    save_mode='INTERNAL',
-                    use_clear=False,
-                    use_cage=cage,
-                    )
-            else:
-                bpy.context.scene.render.use_bake_multires = True
-                bpy.context.scene.render.bake_margin = margin
-                bpy.context.scene.render.bake_type = multi_pass
-                bpy.context.scene.render.use_bake_clear = False
-                bpy.ops.object.bake_image()
-        except RuntimeError as error:
-            _print("%s" % (error), tag=True)
-            err = True
-        else:
-            _print("Completed in %s" % (str(datetime.now() - start)), tag=True)
-        
-        # Bake the mask if samples are non zero
-        if mask_samp > 0:
-            # Set samples to the mask value
-            bake_scene.cycles.samples = mask_samp
-            bake_scene.cycles.aa_samples = mask_samp
-            
-            # Requires adding a pure while emit shader to all the materials first and changing target image
+            # Prepare the materials for the bake type
             for mat in unique_mats:
-                prep_material_for_bake(node, mat.node_tree, 'MASK')
+                if debug: _print(">    Preparing material [%s] for [%s] bake" % (mat.name, bake_type), tag=True)
+                prep_material_for_bake(node, mat.node_tree, bake_type)
                 
                 if bake_strategy != 'TOACT':
-                    # Add image node to material and make it selected + active
+                    # For non To active bakes, add an image node to the material and make it selected + active for bake image
                     image_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
-                    image_node.image = img_mask
+                    image_node.image = img_bake
                     image_node.select = True
                     mat.node_tree.nodes.active = image_node
             
-            if bake_strategy == 'TOACT':
-                # Add image node to target and make it selected + active (should only be one material at this point)
-                image_node = target_cpy.data.materials[0].node_tree.nodes.new("ShaderNodeTexImage")
-                image_node.image = img_mask
-                image_node.select = True
-                target_cpy.data.materials[0].node_tree.nodes.active = image_node
-            
+            # Set 'real' bake pass. PBR use EMIT rather than the named pass, since those passes don't exist.
+            if bake_type in node.bake_pbr:
+                real_bake_type = 'EMIT'
+            elif bake_type in ['CURVATURE', 'CURVE_SMOOTH']:
+                real_bake_type = 'NORMAL'
+                norm_s = 'TANGENT'
+                norm_r = 'POS_X'
+                norm_g = 'POS_Y'
+                norm_b = 'POS_Z'
+            else:
+                real_bake_type = bake_type
+                
+            if debug: _print(">     Real bake type set to [%s]" % (real_bake_type), tag=True)
+                
+            # Update view layer to be safe
+            bpy.context.view_layer.update()
             start = datetime.now()
-            _print(">    -Baking MASK pass: ", tag=True, wrap=False)
+            _print(">    -Baking %s pass: " % (bake_type), tag=True, wrap=False)
             
+            # Do the bake. Most of the properties can be passed as arguments to the operator.
             try:
-                bpy.ops.object.bake(
-                    type='EMIT',
-                    margin=margin + padding,
-                    use_selected_to_active=to_active,
-                    cage_extrusion=ray_dist,
-                    cage_object=cage_obj_name,
-                    save_mode='INTERNAL',
-                    use_clear=False,
-                    use_cage=cage,
-                    )
+                if bake_strategy != 'MULTI':
+                    bpy.ops.object.bake(
+                        type=real_bake_type,
+                        pass_filter=pass_influences,
+                        margin=margin,
+                        use_selected_to_active=to_active,
+                        cage_extrusion=ray_dist,
+                        cage_object=cage_obj_name,
+                        normal_space=norm_s,
+                        normal_r=norm_r,
+                        normal_g=norm_g,
+                        normal_b=norm_b,
+                        save_mode='INTERNAL',
+                        use_clear=False,
+                        use_cage=cage,
+                        )
+                else:
+                    bpy.context.scene.render.use_bake_multires = True
+                    bpy.context.scene.render.bake_margin = margin
+                    bpy.context.scene.render.bake_type = multi_pass
+                    bpy.context.scene.render.use_bake_clear = False
+                    bpy.ops.object.bake_image()
             except RuntimeError as error:
                 _print("%s" % (error), tag=True)
                 err = True
             else:
                 _print("Completed in %s" % (str(datetime.now() - start)), tag=True)
-        
-        # Switch back to main scene before next pass. Nothing will be deleted so that the file can be examined for debugging.
-        bpy.context.window.scene = prev_scene
+            
+            # Bake the mask if samples are non zero
+            if mask_samp > 0:
+                # Set samples to the mask value
+                bake_scene.cycles.samples = mask_samp
+                bake_scene.cycles.aa_samples = mask_samp
+                
+                # Requires adding a pure while emit shader to all the materials first and changing target image
+                for mat in unique_mats:
+                    prep_material_for_bake(node, mat.node_tree, 'MASK')
+                    
+                    if bake_strategy != 'TOACT':
+                        # Add image node to material and make it selected + active
+                        image_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+                        image_node.image = img_mask
+                        image_node.select = True
+                        mat.node_tree.nodes.active = image_node
+                
+                if bake_strategy == 'TOACT':
+                    # Add image node to target and make it selected + active (should only be one material at this point)
+                    image_node = target.data.materials[0].node_tree.nodes.new("ShaderNodeTexImage")
+                    image_node.image = img_mask
+                    image_node.select = True
+                    target.data.materials[0].node_tree.nodes.active = image_node
+                
+                # Update view layer to be safe
+                bpy.context.view_layer.update()
+                start = datetime.now()
+                _print(">    -Baking MASK pass: ", tag=True, wrap=False)
+                
+                try:
+                    bpy.ops.object.bake(
+                        type='EMIT',
+                        margin=margin + padding,
+                        use_selected_to_active=to_active,
+                        cage_extrusion=ray_dist,
+                        cage_object=cage_obj_name,
+                        save_mode='INTERNAL',
+                        use_clear=False,
+                        use_cage=cage,
+                        )
+                except RuntimeError as error:
+                    _print("%s" % (error), tag=True)
+                    err = True
+                else:
+                    _print("Completed in %s" % (str(datetime.now() - start)), tag=True)
+            
+            # Switch back to main scene before next pass. Nothing will be deleted so that the file can be examined for debugging.
+            bpy.context.window.scene = base_scene
     
     # Perform compositor pass if needed
     if bake_type == 'CURVATURE' or bake_type == 'CURVE_SMOOTH':
@@ -448,11 +526,7 @@ def process_bake_pass_input(node):
         if debug: _print(">   Switching to compositor scene", tag=True)
         
         # Switch into compositor scene
-        prev_scene = bpy.context.window.scene
-        prev_layer = bpy.context.view_layer
-        bpy.context.window.scene = compositor_scene
-        # Trick to make the view layer stay the same on switching back maybe?
-        bpy.context.view_layer.name = prev_layer.name       
+        bpy.context.window.scene = compositor_scene      
         
         # Hook up the correct compositor tree to the output node and set the input to the bake data
         if debug: _print(">   Setting composit tree input and output", tag=True)
@@ -480,7 +554,7 @@ def process_bake_pass_input(node):
             img_bake.update()
         
         _print("Completed in %s" % (str(datetime.now() - start)), tag=True)
-        bpy.context.window.scene = prev_scene
+        bpy.context.window.scene = base_scene
         
     _print(">", tag=True)   
     _print(">  Input Meshes processed in %s" % (str(datetime.now() - pass_start)), tag=True)
@@ -539,6 +613,7 @@ def process_bake_pass_output(node, bake, mask, target=None):
             output_image.filepath_raw = os.path.abspath(output_file)
             if node.bake_pass == 'NORMAL':
                 output_image.generated_color = (0.5, 0.5, 1.0, 1.0)
+            output_image.use_generated_float = True
         
         # Set the color space, etc
         #output_image.colorspace_settings.name = output_node.img_color_space
@@ -741,6 +816,7 @@ def convert_to_color_space(bake, color_space, device):
     img_conv.colorspace_settings.name = color_space
     if color_space == 'Non-Color':
         img_conv.colorspace_settings.is_data = True
+    img_conv.use_generated_float = True
     
     # Load up the template scene
     bake_scene_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "resources", "BakeWrangler_Scene.blend")
@@ -755,11 +831,7 @@ def convert_to_color_space(bake, color_space, device):
     bake_scene.name = "convert_" + bake.name + "_" + color_space
     
     # Switch into bake scene
-    prev_scene = bpy.context.window.scene
-    prev_layer = bpy.context.view_layer
     bpy.context.window.scene = bake_scene
-    # Trick to make the view layer stay the same on switching back maybe?
-    bpy.context.view_layer.name = prev_layer.name
     
     # Now create a new plane, stick an emission material on it with the bake and do a new bake
     bpy.ops.object.select_all(action='DESELECT')
@@ -799,7 +871,7 @@ def convert_to_color_space(bake, color_space, device):
         err = True
         
     # Switch back to main scene before next pass. Nothing will be deleted so that the file can be examined for debugging.
-    bpy.context.window.scene = prev_scene
+    bpy.context.window.scene = base_scene
     
     return [err, img_conv, bake_scene]
     
@@ -846,6 +918,8 @@ def prep_material_rec(node, link_socket, bake_type):
             bake_input = node.inputs['Metallic']
         elif bake_type == 'ALPHA':
             bake_input = node.inputs['Alpha']
+        elif bake_type == 'SPECULAR':
+            bake_input = node.inputs['Specular']
         else:
             bake_input = None
             
@@ -1007,7 +1081,6 @@ def main():
         debug = bool(args.debug)
     else:
         debug = False
-        #debug = True
     
     # Make sure the node classes are registered
     try:
