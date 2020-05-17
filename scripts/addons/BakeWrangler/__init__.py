@@ -19,7 +19,7 @@ bl_info = {
     'name': 'Bake Wrangler',
     'description': 'Bake Wrangler aims to improve all baking tasks with a node based interface and provide some additional common bake passes',
     'author': 'Dancing Fortune Software',
-    'version': (0, 9, 5, 2),
+    'version': ('RC', 1, 0),
     'blender': (2, 82, 0),
     'location': 'Editor Type -> Bake Node Editor',
     'wiki_url': '',
@@ -35,14 +35,23 @@ from . import nodes
 class BakeWrangler_Preferences(bpy.types.AddonPreferences):
     bl_idname = __package__
     
+    text_msgs: bpy.props.BoolProperty(name="Messages to Text editor", description="Write messages to a text block in addition to the console", default=True)
+    clear_msgs: bpy.props.BoolProperty(name="Clear Old Messages", description="Clear the text block before each new bake", default=True)
+    wind_msgs: bpy.props.BoolProperty(name="Open Text in new Window", description="A new window will be opened displaying the text block each time a new bake is started (must be closed manually)", default=True)
+    
     debug: bpy.props.BoolProperty(name="Debug", description="Enable additional debugging output", default=False)
 
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, "text_msgs")
+        if self.text_msgs:
+            box = layout.box()
+            box.prop(self, "clear_msgs")
+            box.prop(self, "wind_msgs")
         layout.prop(self, "debug")
         
         
-
+        
 def register():
     from bpy.utils import register_class
     register_class(BakeWrangler_Preferences)

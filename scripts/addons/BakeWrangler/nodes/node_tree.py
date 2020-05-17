@@ -1,6 +1,6 @@
 import os
 import sys
-import threading
+import threading, queue
 import subprocess
 from datetime import datetime, timedelta
 import bpy
@@ -9,8 +9,8 @@ from bpy.types import NodeTree, Node, NodeSocket, NodeSocketColor, NodeSocketFlo
 
 
 # Message formatter
-def _print(str, node=None, ret=False, tag=False, wrap=True):
-    output = str
+def _print(str, node=None, ret=False, tag=False, wrap=True, enque=None, textdata="BakeWrangler"):
+    output = "%s" % (str)
     endl = ''
     flsh = False
     
@@ -18,6 +18,7 @@ def _print(str, node=None, ret=False, tag=False, wrap=True):
         output = "[%s]: %s" % (node.get_name(), output)
         
     if tag:
+        output.replace("<", "<_")
         output = "<%s>%s" % ("PBAKE", output)
         flsh = True
         if wrap:
@@ -28,10 +29,24 @@ def _print(str, node=None, ret=False, tag=False, wrap=True):
     if wrap:
         endl = '\n'
         
+    if enque != None:
+        eout = "%s%s" % (output, endl)
+        enque.put(eout)
+        return None
+        
     if ret:
         return output
-    else:
-        print(output, end=endl, flush=flsh)
+    
+    if textdata != None and _prefs('text_msgs'):
+        if not textdata in bpy.data.texts.keys():
+            bpy.data.texts.new(textdata)
+        text = bpy.data.texts[textdata]
+        end = len(text.lines[len(text.lines) - 1].body) - 1
+        text.cursor_set(len(text.lines) - 1, character=end)
+        tout = "%s%s" % (output, endl)
+        text.write(tout)
+    
+    print(output, end=endl, flush=flsh)
 
 
 
@@ -48,9 +63,16 @@ def _prefs(key):
     if pref and key in prefs:
         return prefs[key]
     else:
+        # Default values to fall back on
         if key == 'debug':
             return False
             #return True
+        elif key == 'text_msgs':
+            return True
+        elif key == 'clear_msgs':
+            return True
+        elif key == 'wind_msgs':
+            return True
         else:
             return None
 
@@ -138,7 +160,12 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
     _success = False
     _finish = False
     _lock = threading.Lock()
+    _queue = queue.SimpleQueue()
     stopping = False
+    
+    open_ed = None
+    node_ed = None
+    split = False
     
     start = None
     valid = None
@@ -146,6 +173,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
     blend_log = None
     bake_proc = None
     was_dirty = False
+    img_list = []
     
     # Stop this bake if it's currently running
     def stop(self, kill=True):
@@ -160,8 +188,8 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         node = tree.nodes[self.node]
         debug = _prefs('debug')
              
-        _print("Launching background process:", node=node)
-        _print("================================================================================")
+        _print("Launching background process:", node=node, enque=self._queue)
+        _print("================================================================================", enque=self._queue)
         sub = subprocess.Popen([
             exec_name,
             file_name,
@@ -180,7 +208,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             # Check for kill flag
             if self._lock.acquire(blocking=False):
                 if self._kill:
-                    _print("Bake canceled, terminating process...")
+                    _print("Bake canceled, terminating process...", enque=self._queue)
                     sub.kill()
                     out, err = sub.communicate()
                     kill = True
@@ -195,39 +223,44 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
                         tag_end = False
                         tag_line = ""
                         out = ""
+                        tag_out = ""
                         # Read until end tag is found
                         while not tag_end:
-                            tag_line = sub.stdout.read(1)
+                            tag = sub.stdout.read(1)
                             
-                            if tag_line == '<':
-                                tag_line += sub.stdout.read(7)
-                                if tag_line == "</PBAKE>":
-                                    tag_end = True
-                                    out += '\n'
-                                elif tag_line == "</PWRAP>":
-                                    tag_end = True
-                                    sys.stdout.write('\n')
-                                    sys.stdout.flush()
-                                elif tag_line == "<FINISH>":
-                                    tag_end = True
-                                    self._success = True
-                                    self._finish = True
-                                elif tag_line == "<ERRORS>":
-                                    tag_end = True
-                                    self._success = False
-                                    self._finish = True
-                                    
-                            if tag_line != '' and not tag_end:
-                                sys.stdout.write(tag_line)
-                                sys.stdout.flush()
-                                out += tag_line
+                            if tag == '<':
+                                tag_line = sub.stdout.read(1)
+                                if tag_line != '_':
+                                    tag_line = tag + tag_line + sub.stdout.read(6)
+                                    if tag_line == "</PBAKE>":
+                                        tag_end = True
+                                        out += '\n'
+                                    elif tag_line == "</PWRAP>":
+                                        tag_end = True
+                                        tag_out += '\n'
+                                        #sys.stdout.write('\n')
+                                        #sys.stdout.flush()
+                                    elif tag_line == "<FINISH>":
+                                        tag_end = True
+                                        self._success = True
+                                        self._finish = True
+                                    elif tag_line == "<ERRORS>":
+                                        tag_end = True
+                                        self._success = False
+                                        self._finish = True
+                            if tag != '' and not tag_end:
+                                tag_out += tag
+                                #sys.stdout.write(tag_line)
+                                #sys.stdout.flush()
+                                out += tag
+                        _print(tag_out, enque=self._queue, wrap=False)
         
             # Write to log
             if out != '' and self.blend_log:
                 self.blend_log.write(out)
                 self.blend_log.flush()
-        _print("================================================================================")
-        _print("Background process ended", node=node)
+        _print("================================================================================", enque=self._queue)
+        _print("Background process ended", node=node, enque=self._queue)
 
     # Event handler
     def modal(self, context, event):
@@ -236,6 +269,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         
         # Check if the bake thread has ended every timer event
         if event.type == 'TIMER':
+            self.print_queue(context)
             # Reapply dirt by pushing something to undo stack (not ideal)
             if self.was_dirty and not bpy.data.is_dirty:
                 bpy.ops.node.select_all(action='INVERT')
@@ -244,25 +278,72 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             if not self._thread.is_alive():
                 self.cancel(context)
                 if self._kill:
-                    _print("Bake canceled after %s\n" % (str(datetime.now() - self.start)), node=node)
+                    _print("Bake canceled after %s" % (str(datetime.now() - self.start)), node=node, enque=self._queue)
+                    _print("Canceled\n", node=node, enque=self._queue)
                     self.report({'WARNING'}, "Bake Canceled")
                     return {'CANCELLED'}
                 else:
                     if self._success and self._finish:
-                        _print("Bake finished in %s\n" % (str(datetime.now() - self.start)), node=node)
+                        _print("Bake finished in %s" % (str(datetime.now() - self.start)), node=node, enque=self._queue)
+                        _print("Success\n", node=node, enque=self._queue)
                         self.report({'INFO'}, "Bake Completed")
                     elif self._finish:
-                        _print("Bake finished with errors after %s\n" % (str(datetime.now() - self.start)), node=node)
+                        _print("Bake finished with errors after %s" % (str(datetime.now() - self.start)), node=node, enque=self._queue)
+                        _print("Errors\n", node=node, enque=self._queue)
                         self.report({'WARNING'}, "Bake Finished with Errors")
                     else:
-                        _print("Bake failed after %s\n" % (str(datetime.now() - self.start)), node=node)
+                        _print("Bake failed after %s" % (str(datetime.now() - self.start)), node=node, enque=self._queue)
+                        _print("Failed\n", node=node, enque=self._queue)
                         self.report({'ERROR'}, "Bake Failed")
+                    self.update_images()
+                    self.print_queue(context)
                     return {'FINISHED'}
-            
         return {'PASS_THROUGH'}
+            
+    # Print queued messages
+    def print_queue(self, context):
+        try:
+            # An Empty exception will be raised when nothing is in the queue
+            while True:
+                msg = self._queue.get_nowait()
+                _print(msg, wrap=False)
+                '''ed = self.open_ed
+                if not ed:
+                    # look for first open log file
+                    for area in context.screen.areas:
+                        if area.type == 'TEXT_EDITOR':
+                            for space in area.spaces:
+                                if space.type == 'TEXT_EDITOR' and space.text and space.text.name == "BakeWrangler":
+                                    ed = area
+                                    break
+                            if ed:
+                                break'''
+                #if ed:
+                #    bpy.ops.text.move({'area': ed}, type='FILE_BOTTOM')  
+        except:
+            return
+        
+    # Update any loaded images that might be changed by the bake
+    def update_images(self):
+        print("Updating Images")
+        if len(self.img_list) and len(bpy.data.images):
+            cwd = os.path.dirname(bpy.data.filepath)
+            for img in bpy.data.images:
+                img_path = os.path.normpath(os.path.join(cwd, bpy.path.abspath(img.filepath_raw)))
+                if img_path in self.img_list:
+                    img.reload()
     
     # Called after invoke to perform the bake if everything passed validation
     def execute(self, context):
+        # If message log in new window is enabled
+        if _prefs("text_msgs") and _prefs("wind_msgs"):
+            bpy.ops.screen.area_dupli('INVOKE_DEFAULT')
+            self.open_ed = context.window_manager.windows[len(context.window_manager.windows) - 1].screen.areas[0]
+            self.open_ed.type = 'TEXT_EDITOR'
+            self.open_ed.spaces[0].text = bpy.data.texts["BakeWrangler"]
+            self.open_ed.spaces[0].show_line_numbers = False
+            self.open_ed.spaces[0].show_syntax_highlight = False
+        
         if self.valid == None:
             self.report({'ERROR'}, "Call invoke first")
             return {'CANCELLED'}
@@ -280,16 +361,16 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         blend_name = bpy.path.clean_name(bpy.path.display_name_from_filepath(bpy.data.filepath))
         blend_temp = bpy.path.abspath(bpy.app.tempdir)
         node_cname = bpy.path.clean_name(node.get_name())
-        blend_copy = os.path.join(blend_temp, blend_name + "_" + node_cname)
+        blend_copy = os.path.join(blend_temp, "BakeWrangler_" + blend_name)
         
         # Increment file name until it doesn't exist
-        if os.path.exists(blend_copy + ".blend"):
+        if os.path.exists(blend_copy + "000.blend"):
             fno = 1
-            while os.path.exists(blend_copy + str(fno) + ".blend"):
+            while os.path.exists(blend_copy + "%03i.blend" % (fno)):
                 fno = fno + 1
-            blend_copy = blend_copy + str(fno) + ".blend"
+            blend_copy = blend_copy + "%03i.blend" % (fno)
         else:
-            blend_copy = blend_copy + ".blend"
+            blend_copy = blend_copy + "000.blend"
         
         # Print out start message and temp path
         _print("")
@@ -332,23 +413,54 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         blend_exec = bpy.path.abspath(bpy.app.binary_path)
         self._thread = threading.Thread(target=self.thread, args=(self.node, self.tree, self.blend_copy, blend_exec, self.bake_proc,))
         
+        # Get a list of image file names that will be updated by the bake so they can be reloaded on success
+        self.img_list = []
+        if node.bl_idname == 'BakeWrangler_Output_Batch_Bake':
+            for input in node.inputs:
+                if input.is_linked and input.valid:
+                    img_name = os.path.join(input.links[0].from_node.img_path, input.links[0].from_node.name_with_ext())
+                    if not self.img_list.count(img_name):
+                        self.img_list.append(img_name)
+        elif node.bl_idname == 'BakeWrangler_Bake_Pass':
+            for output in node.outputs:
+                for link in output.links:
+                    if link.to_socket.valid:
+                        img_name = os.path.join(link.to_node.img_path, link.to_node.name_with_ext())
+                        if not self.img_list.count(img_name):
+                            self.img_list.append(img_name)
+        elif node.bl_idname == 'BakeWrangler_Output_Image_Path':
+            img_name = os.path.join(node.img_path, node.name_with_ext())
+            if not self.img_list.count(img_name):
+                self.img_list.append(img_name)
+        
         # Add a timer to periodically check if the bake has finished
         wm = context.window_manager
-        self._timer = wm.event_timer_add(5.0, window=context.window)
+        self._timer = wm.event_timer_add(0.5, window=context.window)
         wm.modal_handler_add(self)
         
         self._thread.start()
-             
+                
+        # Go modal
         return {'RUNNING_MODAL'}
     
     # Called by UI when the button is clicked. Will validate settings and prepare files for execute
     def invoke(self, context, event):
+        # Are text editor messages enabled?
+        if _prefs("text_msgs"):
+            # Make sure the text block exists
+            if not "BakeWrangler" in bpy.data.texts.keys():
+                bpy.data.texts.new("BakeWrangler")
+            # Clear the block if option set
+            if _prefs("clear_msgs"):
+                bpy.data.texts["BakeWrangler"].clear()
+                
         # Do full validation of bake so it can be reported in the popup dialog
         tree = bpy.data.node_groups[self.tree]
         node = tree.nodes[self.node]
         tree.baking = self
         tree.interface_update(context)
         self.valid = node.validate(is_primary=True)
+        
         # Check processing script exists
         bake_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
         bake_proc = bpy.path.abspath(os.path.join(bake_path, "baker.py"))
@@ -484,19 +596,23 @@ class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
             self.node.update_inputs()
             
     # Get own objects or the full linked tree
-    def get_objects(self, only_mesh=False):
+    def get_objects(self, only_mesh=False, no_lights=False):
         objects = []
         # Follow links
         if self.is_linked and self.valid:
-            return self.links[0].from_node.get_objects(only_mesh)
+            return self.links[0].from_node.get_objects(only_mesh, no_lights)
         # Otherwise return self values
         if self.value and self.type and self.type != 'NONE' and not self.is_linked:
             # Only interested in mesh types?
             if self.type not in ['MESH_DATA', 'GROUP'] and only_mesh:
                 return []
+            if self.type == 'LIGHT_DATA' and no_lights:
+                return []
             # Need to get all the grouped objects
             if self.type == 'GROUP':
-                filter = self.object_types
+                filter = list(self.object_types)
+                if no_lights:
+                    filter.remove('LIGHT')
                 if only_mesh:
                     filter = ['MESH']
                 # Iterate over the objects applying the type filter
@@ -567,11 +683,12 @@ class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
                             valid[0] = False
                             valid.append([_print("Multires error", node=self.node, ret=True), ": No multires data on object <%s>." % (obj.name)])
                 # Check that materials can be converted to enable PBR data bakes
-                if check_materials:
+                if check_materials and obj.type in self.object_types:
                     mats = []
-                    if len(obj.data.materials):
-                        for mat in obj.data.materials:
-                            if not mat in mats:
+                    if len(obj.material_slots):
+                        for slot in obj.material_slots:
+                            mat = slot.material
+                            if mat != None and not mat in mats:
                                 mats.append(mat)
                                 # Is node based?
                                 if not mat.node_tree.nodes:
@@ -682,8 +799,8 @@ class BakeWrangler_Tree_Node:
     
     def get_name(self):
         name = self.name
-        if self.label:
-            name += ".%s" % (self.label)
+        #if self.label:
+        #    name += ".%s" % (self.label)
         return name
     
     def validate(self):
@@ -762,10 +879,10 @@ class BakeWrangler_Input_ObjectList(Node, BakeWrangler_Tree_Node):
         return False
     
     # Get all objects in tree from this node (mostly just uses the sockets methods)
-    def get_objects(self, only_mesh=False):
+    def get_objects(self, only_mesh=False, no_lights=False):
         objects = []
         for input in self.inputs:
-            in_objs = input.get_objects(only_mesh)
+            in_objs = input.get_objects(only_mesh, no_lights)
             if len(in_objs):
                 objects += in_objs
         return objects
@@ -866,17 +983,21 @@ class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
             # Add any generated messages to the stack. Errors here will stop bake
             if len(valid_active):
                 valid += valid_active
+        else:
+            valid[0] = False
+            valid.append([_print("Target error", node=self, ret=True), ": No valid target objects selected"])
         return valid
         
     # Return the requested set of objects from the appropriate input socket
     def get_objects(self, set):
+        _print("Getting objects in %s" % (set))
         objs = []
         count = []
         dups = []
         if set == 'TARGET':
-            objs = self.inputs["Target"].get_objects(True)
+            objs = self.inputs["Target"].get_objects(only_mesh=True)
         elif set == 'SOURCE':
-            objs = self.inputs["Source"].get_objects()
+            objs = self.inputs["Source"].get_objects(no_lights=True)
         elif set == 'SCENE':
             objs = self.inputs["Scene"].get_objects()      
         # First remove duplicates
@@ -1041,6 +1162,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         ('CURVE_SMOOTH', "Curvature (Smoothed)", "Curvature map with smoothing applied"),
         ('CURVATURE', "Curvature", "Surface curvature map computed from tangent normals"),
         ('ROUGHNESS', "Roughness", "Surface roughness values"),
+        ('SMOOTHNESS', "Smoothness", "Surface inverted roughness values"),
         ('AO', "Ambient Occlusion", "Surface self occlusion values"),
         ('CAVITY', "Cavity", "Surface cavity occlusion map"),
         
@@ -1098,6 +1220,14 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     use_ao: bpy.props.BoolProperty(name="Ambient Occlusion", description="Add ambient occlusion contribution", default=True)
     use_emit: bpy.props.BoolProperty(name="Emit", description="Add emission contribution", default=True)
     curve_px: bpy.props.IntProperty(name="Curve Pixel Width", description="Curvature edge pixel width", default=1)
+    use_world: bpy.props.BoolProperty(name="Use World", description="Enabled to pick a world to use (empty to use active), instead of Bake Wranglers default", default=False)
+    the_world: bpy.props.PointerProperty(name="World", description="World to use instead of Bake Wranglers default (empty to use active)", type=bpy.types.World)
+    cpy_render: bpy.props.BoolProperty(name="Copy Settings", description="Copy render settings from selected scene (empty to use active), instead of using defaults", default=False)
+    cpy_from: bpy.props.PointerProperty(name="Render Scene", description="Scene to copy render settings from (empty to use active)", type=bpy.types.Scene)
+    cavity_samp: bpy.props.IntProperty(name="Cavity Over Samples", description="Number of cavity samples per point (more gives a bettre result but takes longer)", default=16)
+    cavity_dist: bpy.props.FloatProperty(name="Cavity Sample Distance", description="How far away a face can be to contribute to the cavity calcuation (may need larger distances for larger objects)", default=0.4, step=1, min=0.0, unit='LENGTH')
+    cavity_gamma: bpy.props.FloatProperty(name="Cavity Gamma", description="Gamma transform to be performed on cavity values", default=2.2, step=1)
+    use_float: bpy.props.BoolProperty(name="Use Float Buffer", description="Enabled 32 bit float buffer for bake. When using this for baking data, color space should be set to Non-Color or you may get odd results", default=False)
     
     def init(self, context):
         # Set label to pass
@@ -1133,6 +1263,11 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
             split = layout.split(factor=0.5)
             split.label(text="Px Width:")
             split.prop(self, "curve_px", text="")
+        elif self.bake_pass == 'CAVITY':
+            col = layout.column(align=True)
+            col.prop(self, "cavity_samp", text="Over Samples")
+            col.prop(self, "cavity_dist", text="Distance")
+            col.prop(self, "cavity_gamma", text="Gamma")
         elif self.bake_pass in self.bake_has_influence:
             row = layout.row(align=True)
             row.use_property_split = False
@@ -1163,7 +1298,16 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         split = layout.split(factor=0.15)
         split.label(text="Y:")
         split.prop(self, "bake_yres", text="")
-
+        row = layout.row(align=True)
+        row.prop(self, "use_float", text="Use 32 Bit Float")
+        row = layout.row(align=True)
+        row.prop(self, "use_world", text="Use My World", toggle=True)
+        if self.use_world:
+            row.prop_search(self, "the_world", bpy.data, "worlds", text="")
+        row = layout.row(align=True)
+        row.prop(self, "cpy_render", text="Use My Settings", toggle=True)
+        if self.cpy_render:
+            row.prop_search(self, "cpy_from", bpy.data, "scenes", text="")
 
 # Output node that specifies the path to a file where a bake should be saved along with size and format information.
 # Takes input from the outputs of a bake pass node. Connecting multiple inputs will cause higher position inputs to
@@ -1174,7 +1318,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     bl_label = 'Output Image Path'
     bl_width_default = 157
     
-    # Returns the most identifing string for the node
+    # Returns the most identifying string for the node
     def get_name(self):
         name = BakeWrangler_Tree_Node.get_name(self)
         if self.img_name:
@@ -1209,7 +1353,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             valid[0] = False
             valid.append([_print("Path error", node=self, ret=True), ": Invalid path '%s'" % (os.path.abspath(self.img_path))])
         # Check if there is read/write access to the file/directory
-        file_path = os.path.join(os.path.abspath(self.img_path), self.img_name)
+        file_path = os.path.join(os.path.abspath(self.img_path), self.name_with_ext())
         if os.path.exists(file_path):
             if os.path.isfile(file_path):
                 # It exists so try to open it r/w
@@ -1243,22 +1387,26 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         # Validated
         return valid
     
-    def update_path(self, context):
+    # Get full path, removing any relative references
+    def get_full_path(self, context):
         cwd = os.path.dirname(bpy.data.filepath)
-        path = os.path.normpath(os.path.join(cwd, bpy.path.abspath(self.img_path)))
-        if self.img_path != path:
-            self.img_path = path
-        
-    def update_ext(self, context):
+        self.img_path = os.path.normpath(os.path.join(cwd, bpy.path.abspath(self.disp_path)))
+    
+    # Return the file name with the correct image type extension (unless it has an existing unknown extension)
+    def name_with_ext(self):
         name, ext = os.path.splitext(self.img_name)
-        if ext:
+        if ext not in [".", "", None]:
             for enum, iext in self.img_ext:
                 if ext.lower() == iext:
                     for enum, iext in self.img_ext:
                         if self.img_type == enum:
-                            self.img_name = name + iext
-                            break
+                            return (name + iext)
                     break
+            return self.img_name
+        else:
+            for enum, iext in self.img_ext:
+                if self.img_type == enum:
+                    return (name + iext)
     
     # Recreate image format drop down as the built in one doesn't seem usable? Also most of the settings
     # for the built in image settings selector don't seem applicable to saving from script...
@@ -1362,6 +1510,13 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         ('XYZ', "XYZ", "XYZ"),
     )
     
+    # Return a dict of format settings
+    def get_format(self):
+        format = {}
+        for prop in self.rna_type.properties.keys():
+            format[prop] = getattr(self, prop)
+        return format
+    
     # Properties that are part of the ImageFormatSettings data, recreated here because that data block isn't usable by mods
     # Color Modes
     img_color_mode: bpy.props.EnumProperty(name="Color", description="Choose BW for saving grayscale images, RGB for saving red, green and blue channels, and RGBA for saving red, green, blue and alpha channels", items=img_color_modes, default='RGB')
@@ -1391,9 +1546,10 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     
     img_color_space: bpy.props.EnumProperty(name="Color Space", description="Color space to use when saving the image", items=img_color_spaces, default='sRGB')
     #image: bpy.props.PointerProperty(type=bpy.types.Image)
-    img_path: bpy.props.StringProperty(name="Output Path", description="Path to save image in", default="", subtype='DIR_PATH', update=update_path)
+    disp_path: bpy.props.StringProperty(name="Output Path", description="Path to save image in", default="", subtype='DIR_PATH', update=get_full_path)
+    img_path: bpy.props.StringProperty(name="Output Path", description="Path to save image in", default="", subtype='DIR_PATH')
     img_name: bpy.props.StringProperty(name="Output File", description="File to save image in", default="Image", subtype='FILE_NAME')
-    img_type: bpy.props.EnumProperty(name="Image Format", description="File format to save bake as", items=img_format, default='PNG', update=update_ext)
+    img_type: bpy.props.EnumProperty(name="Image Format", description="File format to save bake as", items=img_format, default='PNG')
     img_xres: bpy.props.IntProperty(name="Image X resolution", description="Number of horizontal pixels in image. Bake pass data will be scaled to fit the image size. Power of 2 sizes are usually best for exporting", default=2048, min=1, subtype='PIXEL')
     img_yres: bpy.props.IntProperty(name="Image Y resolution", description="Number of vertical pixels in image. Bake pass data will be scaled to fit the image size. Power of 2 sizes are usually best for exporting", default=2048, min=1, subtype='PIXEL')
 
@@ -1411,16 +1567,11 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         for type, name, desc in self.img_format:
             if bpy.context.scene.render.image_settings.file_format == type:
                 self.img_type = type
-                # Set the extension
-                for enum, ext in self.img_ext:
-                    if enum == type:
-                        self.img_name += ext
-                break
 
     def draw_buttons(self, context, layout):
         BakeWrangler_Tree_Node.draw_bake_button(self, layout, 'IMAGE', "Bake Image")
         layout.label(text="Image Path:")
-        layout.prop(self, "img_path", text="")
+        layout.prop(self, "disp_path", text="")
         layout.prop(self, "img_name", text="")
         split = layout.split(factor=0.4)
         split.label(text="Format:")
@@ -1437,16 +1588,16 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             split.label(text="Space:")
             split.prop(self, "img_color_space", text="")
         # Color Modes
-        if self.img_type == 'BMP' or self.img_type == 'JPEG' or self.img_type == 'CINEON' or self.img_type == 'HDR':
+        if self.img_type in ['BMP', 'JPEG', 'CINEON', 'HDR']:
             split = layout.split(factor=0.4)
             split.label(text="Color:")
             split.prop(self, "img_color_mode_noalpha", text="")
-        if self.img_type == 'IRIS' or self.img_type == 'PNG' or self.img_type == 'JPEG2000' or self.img_type == 'TARGA' or self.img_type == 'TARGA_RAW' or self.img_type == 'DPX' or self.img_type == 'OPEN_EXR_MULTILAYER' or self.img_type == 'OPEN_EXR' or self.img_type == 'TIFF':
+        if self.img_type in ['IRIS', 'PNG', 'JPEG2000', 'TARGA', 'TARGA_RAW', 'DPX', 'OPEN_EXR_MULTILAYER', 'OPEN_EXR', 'TIFF']:
             split = layout.split(factor=0.4)
             split.label(text="Color:")
             split.prop(self, "img_color_mode", text="")
         # Color Depths
-        if self.img_type == 'PNG' or self.img_type == 'TIFF':
+        if self.img_type in ['PNG', 'TIFF']:
             split = layout.split(factor=0.4)
             split.label(text="Depth:")
             split.prop(self, "img_color_depth_8_16", text="")
@@ -1458,7 +1609,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             split = layout.split(factor=0.4)
             split.label(text="Depth:")
             split.prop(self, "img_color_depth_8_10_12_16", text="")
-        if self.img_type == 'OPEN_EXR_MULTILAYER' or self.img_type == 'OPEN_EXR':
+        if self.img_type in ['OPEN_EXR_MULTILAYER', 'OPEN_EXR']:
             split = layout.split(factor=0.4)
             split.label(text="Depth:")
             split.prop(self, "img_color_depth_16_32", text="")
@@ -1467,7 +1618,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             split = layout.split(factor=0.4)
             split.label(text="Compression:")
             split.prop(self, "img_compression", text="")
-        if self.img_type == 'JPEG' or self.img_type == 'JPEG2000':
+        if self.img_type in ['JPEG', 'JPEG2000']:
             split = layout.split(factor=0.4)
             split.label(text="Quality:")
             split.prop(self, "img_quality", text="")
@@ -1476,7 +1627,7 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             split = layout.split(factor=0.4)
             split.label(text="Codec:")
             split.prop(self, "img_codec_jpeg2k", text="")
-        if self.img_type == 'OPEN_EXR' or self.img_type == 'OPEN_EXR_MULTILAYER':
+        if self.img_type in ['OPEN_EXR', 'OPEN_EXR_MULTILAYER']:
             split = layout.split(factor=0.4)
             split.label(text="Codec:")
             split.prop(self, "img_codec_openexr", text="")
@@ -1619,8 +1770,14 @@ def BakeWranger_Hook_Post_NewTree(dummy):
     ctx = bpy.context
     if ctx.area and ctx.area.ui_type == 'BakeWrangler_Tree':
         if debug: _print("Starting post depsgraph update")
-        if len(ctx.area.spaces) > 0 and hasattr(ctx.area.spaces[0], 'node_tree'):
-            tree = ctx.area.spaces[0].node_tree
+        if len(ctx.area.spaces) > 0:
+            space = None
+            for spc in ctx.area.spaces:
+                if spc.type == 'NODE_EDITOR' and hasattr(spc, 'node_tree'):
+                    space = spc
+                    break
+        if space:
+            tree = space.node_tree
             # Init a new tree
             if tree and not tree.initialised:
                 if debug: _print("New/Uninitialized node tree active")
@@ -1755,6 +1912,8 @@ def BakeWranger_Hook_Post_NewTree(dummy):
                                     if pas[0] == node.bake_pass:
                                         node.label = "Pass: " + pas[1]
                                         break
+                    # Fix version number
+                    tree.tree_version = 3
                                         
 
 
