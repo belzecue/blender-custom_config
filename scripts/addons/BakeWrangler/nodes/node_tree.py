@@ -51,6 +51,11 @@ def _print(str, node=None, ret=False, tag=False, wrap=True, enque=None, textdata
 
 
 # Preference reader
+default_true  = ["text_msgs", "clear_msgs", "wind_msgs", "def_filter_mesh", "def_filter_curve", "def_filter_surface",
+                 "def_filter_meta", "def_filter_font", "def_filter_light",]
+default_false = ["def_filter_collection", "def_show_adv", "ignore_vis", "save_pass", "make_dirs",]
+default_res   = ["def_xres", "def_yres", "def_xout", "def_yout",]
+default_zero  = ["def_margin", "def_mask_margin",]
 def _prefs(key):
     try:
         name = __package__.split('.')
@@ -65,14 +70,28 @@ def _prefs(key):
     else:
         # Default values to fall back on
         if key == 'debug':
-            return False
             #return True
-        elif key == 'text_msgs':
+            return False
+        elif key in default_true:
             return True
-        elif key == 'clear_msgs':
-            return True
-        elif key == 'wind_msgs':
-            return True
+        elif key in default_false:
+            return False
+        elif key in default_res:
+            return 1024
+        elif key in default_zero:
+            return 0
+        elif key == 'def_device':
+            return 0 # CPU
+        elif key == 'def_samples':
+            return 1
+        elif key == 'def_format':
+            return 2 # PNG
+        elif key == 'def_raydist':
+            return 0.01
+        elif key == 'def_outpath':
+            return ""
+        elif key == 'def_outname':
+            return "Image"
         else:
             return None
 
@@ -80,7 +99,7 @@ def _prefs(key):
 
 # Material validation recursor (takes a shader node and descends the tree via recursion)
 def material_recursor(node):
-    # Accepted node types are OUTPUT_MATERIAL, BSDF_PRINCIPLED and MIX_SHADER
+    # Accepted node types are OUTPUT_MATERIAL, BSDF_PRINCIPLED and MIX_SHADER (plus REROUTE)
     if node.type == 'BSDF_PRINCIPLED':
         return True
     if node.type == 'OUTPUT_MATERIAL' and node.inputs['Surface'].is_linked:
@@ -93,9 +112,36 @@ def material_recursor(node):
         if node.inputs[2].is_linked:
             inputB = material_recursor(node.inputs[2].links[0].from_node)
         return inputA and inputB
-        
+    if node.type == 'REROUTE' and node.inputs[0].is_linked:
+        return material_recursor(node.inputs[0].links[0].from_node)
     return False
-                    
+
+
+
+# Follow an input link through any reroutes
+def follow_input_link(link):
+    if link.from_node.type == 'REROUTE':
+        if link.from_node.inputs[0].is_linked:
+            try: # During link insertion this can have weird states
+                return follow_input_link(link.from_node.inputs[0].links[0])
+            except:
+                pass
+    return link
+
+
+
+# Gather all links from an output, going past any reroutes
+def gather_output_links(output):
+    links = []
+    for link in output.links:
+        if link.is_valid:
+            if link.to_node.type == 'REROUTE':
+                if link.to_node.outputs[0].is_linked:
+                    links += gather_output_links(link.to_node.outputs[0])
+            else:
+                links.append(link)
+    return links
+
 
 
 #
@@ -165,7 +211,6 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
     
     open_ed = None
     node_ed = None
-    split = False
     
     start = None
     valid = None
@@ -187,6 +232,8 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         tree = bpy.data.node_groups[self.tree]
         node = tree.nodes[self.node]
         debug = _prefs('debug')
+        savepass = _prefs('save_pass')
+        ignorevis = _prefs('ignore_vis')
              
         _print("Launching background process:", node=node, enque=self._queue)
         _print("================================================================================", enque=self._queue)
@@ -199,6 +246,8 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             "--tree", tree_name,
             "--node", node_name,
             "--debug", str(int(debug)),
+            "--savepass", str(int(savepass)),
+            "--ignorevis", str(int(ignorevis)),
             ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         
         # Read output from subprocess and print tagged lines
@@ -241,10 +290,12 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
                                         #sys.stdout.write('\n')
                                         #sys.stdout.flush()
                                     elif tag_line == "<FINISH>":
+                                        tag_line += sub.stdout.read(8)
                                         tag_end = True
                                         self._success = True
                                         self._finish = True
                                     elif tag_line == "<ERRORS>":
+                                        tag_line += sub.stdout.read(8)
                                         tag_end = True
                                         self._success = False
                                         self._finish = True
@@ -291,10 +342,12 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
                         _print("Bake finished with errors after %s" % (str(datetime.now() - self.start)), node=node, enque=self._queue)
                         _print("Errors\n", node=node, enque=self._queue)
                         self.report({'WARNING'}, "Bake Finished with Errors")
+                        self.show_log()
                     else:
                         _print("Bake failed after %s" % (str(datetime.now() - self.start)), node=node, enque=self._queue)
                         _print("Failed\n", node=node, enque=self._queue)
                         self.report({'ERROR'}, "Bake Failed")
+                        self.show_log()
                     self.update_images()
                     self.print_queue(context)
                     return {'FINISHED'}
@@ -307,25 +360,22 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
             while True:
                 msg = self._queue.get_nowait()
                 _print(msg, wrap=False)
-                '''ed = self.open_ed
-                if not ed:
-                    # look for first open log file
-                    for area in context.screen.areas:
-                        if area.type == 'TEXT_EDITOR':
-                            for space in area.spaces:
-                                if space.type == 'TEXT_EDITOR' and space.text and space.text.name == "BakeWrangler":
-                                    ed = area
-                                    break
-                            if ed:
-                                break'''
-                #if ed:
-                #    bpy.ops.text.move({'area': ed}, type='FILE_BOTTOM')  
         except:
             return
         
+    # Display log file if debugging is enabled and the bake failed or had errors
+    def show_log(self):
+        if _prefs('debug') and self.blend_log:
+            bpy.ops.screen.area_dupli({'area': self.node_ed}, 'INVOKE_DEFAULT')
+            open_ed = bpy.context.window_manager.windows[len(bpy.context.window_manager.windows) - 1].screen.areas[0]
+            open_ed.type = 'TEXT_EDITOR'
+            log = bpy.data.texts.load(self.blend_copy + ".log")
+            open_ed.spaces[0].text = log
+            open_ed.spaces[0].show_line_numbers = False
+            open_ed.spaces[0].show_syntax_highlight = False            
+            
     # Update any loaded images that might be changed by the bake
     def update_images(self):
-        print("Updating Images")
         if len(self.img_list) and len(bpy.data.images):
             cwd = os.path.dirname(bpy.data.filepath)
             for img in bpy.data.images:
@@ -361,16 +411,16 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         blend_name = bpy.path.clean_name(bpy.path.display_name_from_filepath(bpy.data.filepath))
         blend_temp = bpy.path.abspath(bpy.app.tempdir)
         node_cname = bpy.path.clean_name(node.get_name())
-        blend_copy = os.path.join(blend_temp, "BakeWrangler_" + blend_name)
+        blend_copy = os.path.join(blend_temp, "BW_" + blend_name)
         
         # Increment file name until it doesn't exist
-        if os.path.exists(blend_copy + "000.blend"):
+        if os.path.exists(blend_copy + "_000.blend"):
             fno = 1
-            while os.path.exists(blend_copy + "%03i.blend" % (fno)):
+            while os.path.exists(blend_copy + "_%03i.blend" % (fno)):
                 fno = fno + 1
-            blend_copy = blend_copy + "%03i.blend" % (fno)
+            blend_copy = blend_copy + "_%03i.blend" % (fno)
         else:
-            blend_copy = blend_copy + "000.blend"
+            blend_copy = blend_copy + "_000.blend"
         
         # Print out start message and temp path
         _print("")
@@ -404,7 +454,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         # Print out blend copy and log names
         _print(" - %s" % (os.path.basename(self.blend_copy)), node=node) 
         if self.blend_log and not log_err:
-            _print(" - %s" % (os.path.basename(blend_copy + ".log")), node=node)
+            _print(" - %s" % (os.path.basename(self.blend_copy + ".log")), node=node)
         else:
             _print(" - Log file creation failed: %s" % (log_err), node=node)
         
@@ -417,13 +467,13 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
         self.img_list = []
         if node.bl_idname == 'BakeWrangler_Output_Batch_Bake':
             for input in node.inputs:
-                if input.is_linked and input.valid:
-                    img_name = os.path.join(input.links[0].from_node.img_path, input.links[0].from_node.name_with_ext())
+                if input.islinked() and input.valid:
+                    img_name = os.path.join(follow_input_link(input.links[0]).from_node.img_path, follow_input_link(input.links[0]).from_node.name_with_ext())
                     if not self.img_list.count(img_name):
                         self.img_list.append(img_name)
         elif node.bl_idname == 'BakeWrangler_Bake_Pass':
             for output in node.outputs:
-                for link in output.links:
+                for link in gather_output_links(output):
                     if link.to_socket.valid:
                         img_name = os.path.join(link.to_node.img_path, link.to_node.name_with_ext())
                         if not self.img_list.count(img_name):
@@ -455,6 +505,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
                 bpy.data.texts["BakeWrangler"].clear()
                 
         # Do full validation of bake so it can be reported in the popup dialog
+        self.node_ed = context.area
         tree = bpy.data.node_groups[self.tree]
         node = tree.nodes[self.node]
         tree.baking = self
@@ -525,7 +576,7 @@ class BakeWrangler_Operator_BakePass(BakeWrangler_Operator, bpy.types.Operator):
 # Bake Wrangler nodes system
 #
 
-BW_TREE_VERSION = 3
+BW_TREE_VERSION = 4
 
 # Node tree definition that shows up in the editor type list. Sets the name, icon and description.
 class BakeWrangler_Tree(NodeTree):
@@ -541,6 +592,7 @@ class BakeWrangler_Tree(NodeTree):
     tree_version: bpy.props.IntProperty(name="Tree Version", default=0)
         
 
+
 # Custom Sockets:
 
 # Base class for all bakery sockets
@@ -549,7 +601,11 @@ class BakeWrangler_Tree_Socket:
     valid: bpy.props.BoolProperty()
     
     def socket_label(self, text):
-        if self.is_output or (self.is_linked and self.valid) or (not self.is_output and not self.is_linked):
+        if self.name == "A" and self.is_linked and self.valid and self.node.bl_idname == "BakeWrangler_Output_Image_Path" and \
+           self.node.img_type in ['IRIS', 'PNG', 'JPEG2000', 'TARGA', 'TARGA_RAW', 'DPX', 'OPEN_EXR_MULTILAYER', 'OPEN_EXR', 'TIFF'] and \
+           self.node.img_color_mode != 'RGBA':
+            return text + " [RGBA Only]"
+        elif self.is_output or (self.is_linked and self.valid) or (not self.is_output and not self.is_linked):
             return text
         else:
             return text + " [invalid]"
@@ -560,6 +616,22 @@ class BakeWrangler_Tree_Socket:
         else:
             return color
     
+    # Follows through reroutes
+    def islinked(self):
+        if self.is_linked and not self.is_output:
+            try: # During link removal this can be in a weird state
+                node = self.links[0].from_node
+                while node.type == "REROUTE":
+                    if node.inputs[0].is_linked and node.inputs[0].links[0].is_valid:
+                        node = node.inputs[0].links[0].from_node
+                    else:
+                        return False
+                return True
+            except:
+                pass
+        return False                
+
+
 
 # Socket for an object or list of objects to be used in a bake pass in some way
 class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
@@ -599,8 +671,8 @@ class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
     def get_objects(self, only_mesh=False, no_lights=False):
         objects = []
         # Follow links
-        if self.is_linked and self.valid:
-            return self.links[0].from_node.get_objects(only_mesh, no_lights)
+        if self.islinked() and self.valid:
+            return follow_input_link(self.links[0]).from_node.get_objects(only_mesh, no_lights)
         # Otherwise return self values
         if self.value and self.type and self.type != 'NONE' and not self.is_linked:
             # Only interested in mesh types?
@@ -643,10 +715,10 @@ class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
     def validate(self, check_materials=False, check_as_active=False, check_multi=False):
         valid = [True]
         # Follow links
-        if self.is_linked and self.valid:
-            return self.links[0].from_node.validate(check_materials, check_as_active, check_multi)
+        if self.islinked() and self.valid:
+            return follow_input_link(self.links[0]).from_node.validate(check_materials, check_as_active, check_multi)
         # Has a value and isn't linked
-        if self.value and self.type and not self.is_linked:
+        if self.value and self.type and not self.islinked():
             objs = [self.value]
             if self.type == 'GROUP':
                 objs = self.get_grouped()
@@ -691,7 +763,7 @@ class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
                             if mat != None and not mat in mats:
                                 mats.append(mat)
                                 # Is node based?
-                                if not mat.node_tree.nodes:
+                                if not mat.node_tree or not mat.node_tree.nodes:
                                     valid.append([_print("Material warning", node=self.node, ret=True), ": <%s> not a node based material" % (mat.name)])
                                     continue
                                 # Is a 'principled' material?
@@ -715,7 +787,7 @@ class BakeWrangler_Socket_Object(NodeSocket, BakeWrangler_Tree_Socket):
     cage: bpy.props.PointerProperty(name="Cage", description="Mesh to use a cage", type=bpy.types.Object, poll=cage_prop_filter)
     
     def draw(self, context, layout, node, text):
-        if not self.is_output and not self.is_linked:
+        if not self.is_output and not self.islinked():
             row = layout.row(align=True)
             label = ""
             if self.name in ['Target', 'Source', 'Scene']:
@@ -787,7 +859,7 @@ class BakeWrangler_Socket_Bake(NodeSocket, BakeWrangler_Tree_Socket):
 
     def draw_color(self, context, node):
         return BakeWrangler_Tree_Socket.socket_color(self, (1.0, 0.5, 1.0, 1.0))
-    
+
 
 # Custom Nodes:
 
@@ -824,13 +896,13 @@ class BakeWrangler_Tree_Node:
         self.update_inputs()
         # Links can get inserted without calling insert_link, but update is called.
         for socket in self.inputs:
-            if socket.is_linked and not socket.valid:
+            if socket.islinked():
                 self.insert_link(socket.links[0])
     
     # Validate incoming links
     def insert_link(self, link):
         if link.to_node == self:
-            if link.from_socket.bl_idname == link.to_socket.bl_idname and link.is_valid:
+            if follow_input_link(link).from_socket.bl_idname == link.to_socket.bl_idname and link.is_valid:
                 link.to_socket.valid = True
             else:
                 link.to_socket.valid = False
@@ -911,7 +983,15 @@ class BakeWrangler_Input_ObjectList(Node, BakeWrangler_Tree_Node):
         self.inputs.new('BakeWrangler_Socket_Object', "Object")
         # Sockets OUT
         self.outputs.new('BakeWrangler_Socket_Object', "Objects")
-  
+        # Prefs
+        self.filter_mesh = _prefs("def_filter_mesh")
+        self.filter_curve = _prefs("def_filter_curve")
+        self.filter_surface = _prefs("def_filter_surface")
+        self.filter_meta = _prefs("def_filter_meta")
+        self.filter_font = _prefs("def_filter_font")
+        self.filter_light = _prefs("def_filter_light")
+        self.filter_collection = _prefs("def_filter_collection")
+         
     def draw_buttons(self, context, layout):
         row = layout.row(align=True)
         row0 = row.row()
@@ -943,11 +1023,6 @@ class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
     def update_inputs(self):
         pass
         
-    # Change inputs based on multi-res enabled
-    def update_multi_res(self, context):
-        self.inputs["Source"].hide = self.multi_res
-        self.inputs["Scene"].hide = self.multi_res
-        
     # Determine if object meets current input filter
     def input_filter(self, input_name, object):
         if input_name == "Target":
@@ -962,11 +1037,11 @@ class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
         return False
         
     # Check node settings are valid to bake. Returns true/false, plus error message.
-    def validate(self, check_materials=False):
+    def validate(self, check_materials=False, multires=False):
         valid = [True]
         # Check source objects
         has_selected = False
-        if not self.multi_res:
+        if not multires:
             has_selected = len(self.inputs["Source"].get_objects()) > 0
         if has_selected and check_materials:
             valid_selected = self.inputs["Source"].validate(check_materials)
@@ -978,7 +1053,7 @@ class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
         # Check target meshes
         has_active = len(self.inputs["Target"].get_objects(True)) > 0
         if has_active:
-            valid_active = self.inputs["Target"].validate(check_materials, True, self.multi_res)
+            valid_active = self.inputs["Target"].validate(check_materials, True, multires)
             valid[0] = valid_active.pop(0)
             # Add any generated messages to the stack. Errors here will stop bake
             if len(valid_active):
@@ -1046,17 +1121,10 @@ class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
         # Return pruned object list
         return objs
         
-    multi_res_passes = (
-        ('NORMALS', "Normals", "Bake normals"),
-        ('DISPLACEMENT', "Displacement", "Bake displacement"),
-    )
-    
     ray_dist: bpy.props.FloatProperty(name="Ray Distance", description="Distance to use for inward ray cast when using a selected to active bake", default=0.01, step=1, min=0.0, unit='LENGTH')
     margin: bpy.props.IntProperty(name="Margin", description="Extends the baked result as a post process filter", default=0, min=0, subtype='PIXEL')
-    mask_margin: bpy.props.IntProperty(name="Mask Margin", description="Adds extra padding to the mask bake. Use if edge details are being cut off", default=0, min=0, subtype='PIXEL')
-    multi_res: bpy.props.BoolProperty(name="Multires", description="Bake directly from multires object. This will disable or ignore the other bake settings.\nOnly Normals and Displacment can be baked", update=update_multi_res)
-    multi_res_pass: bpy.props.EnumProperty(name="Pass", description="Choose shading information to bake into the image.\nMultires pass will override any connected bake pass", items=multi_res_passes, default='NORMALS')
-
+    mask_margin: bpy.props.IntProperty(name="Mask Margin", description="Adds extra padding to the mask bake. Use if edge details are being cut off when masking is enabled", default=0, min=0, subtype='PIXEL')
+    
     def init(self, context):
         # Sockets IN
         self.inputs.new('BakeWrangler_Socket_Object', "Target")
@@ -1064,22 +1132,24 @@ class BakeWrangler_Bake_Mesh(Node, BakeWrangler_Tree_Node):
         self.inputs.new('BakeWrangler_Socket_Object', "Scene")
         # Sockets OUT
         self.outputs.new('BakeWrangler_Socket_Mesh', "Mesh")
+        # Prefs
+        self.ray_dist = _prefs("def_raydist")
+        self.margin = _prefs("def_margin")
+        self.mask_margin = _prefs("def_mask_margin")
         
     def draw_buttons(self, context, layout):
-        layout.prop(self, "margin", text="Margin")
-        layout.prop(self, "mask_margin", text="Padding")
-        layout.prop(self, "multi_res", text="From Multires")
-        if not self.multi_res:
-            layout.prop(self, "ray_dist", text="Ray Dist")
-        else:
-            layout.prop(self, "multi_res_pass")
+        col = layout.column(align=False)
+        col.prop(self, "margin")
+        col.prop(self, "mask_margin")
+        col.prop(self, "ray_dist")
+
         
         
 # Baking node that holds all the settings for a type of bake 'pass'. Takes one or more mesh input nodes as input.
 class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     '''Baking pass node'''
     bl_label = 'Pass'
-    bl_width_default = 150
+    bl_width_default = 160
     
     # Returns the most identifing string for the node
     def get_name(self):
@@ -1116,12 +1186,13 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         valid = [True]
         # Validate inputs
         has_valid_input = False
+        is_multires = (self.bake_pass == 'MULTIRES')
         for input in self.inputs:
-            if input.is_linked and input.valid:
+            if input.islinked() and input.valid:
                 if self.bake_pass in self.bake_pbr:
-                    input_valid = input.links[0].from_node.validate(check_materials=True)
+                    input_valid = follow_input_link(input.links[0]).from_node.validate(check_materials=True)
                 else:
-                    input_valid = input.links[0].from_node.validate()
+                    input_valid = follow_input_link(input.links[0]).from_node.validate(multires=is_multires)
                 if not input_valid.pop(0):
                     valid[0] = False
                 else:
@@ -1137,7 +1208,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
             has_valid_output = False
             for output in self.outputs:
                 if output.is_linked:
-                    for link in output.links:
+                    for link in gather_output_links(output):
                         if link.is_valid and link.to_socket.valid:
                             output_valid = link.to_node.validate()
                             if not output_valid.pop(0):
@@ -1159,14 +1230,13 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         ('ALPHA', "Alpha", "Surface transparency values (Principled shader only)"),
         
         ('NORMAL', "Normal", "Surface normals"),
-        ('CURVE_SMOOTH', "Curvature (Smoothed)", "Curvature map with smoothing applied"),
         ('CURVATURE', "Curvature", "Surface curvature map computed from tangent normals"),
         ('ROUGHNESS', "Roughness", "Surface roughness values"),
         ('SMOOTHNESS', "Smoothness", "Surface inverted roughness values"),
         ('AO', "Ambient Occlusion", "Surface self occlusion values"),
         ('CAVITY', "Cavity", "Surface cavity occlusion map"),
         
-        ('SUBSURFACE', "Subsurface", "Subsurface color"),
+        #('SUBSURFACE', "Subsurface", "Subsurface color"),
         ('TRANSMISSION', "Transmission", "Colors of light passing through a material"),
         ('GLOSSY', "Glossy", "Colors of a surface generated by a glossy shader"),
         ('DIFFUSE', "Diffuse", "Colors of a surface generated by a diffuse shader"),
@@ -1175,6 +1245,8 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         ('UV', "UV", "UV Layout"),
         ('SHADOW', "Shadow", "Shadow map"),
         ('COMBINED', "Combined", "Combine multiple passes into a single bake"),
+        
+        ('MULTIRES', "Multiresolution", "Data from a multiresolution modifier"),
     )
     
     bake_built_in = ['NORMAL', 'ROUGHNESS', 'AO', 'SUBSURFACE', 'TRANSMISSION', 'GLOSSY', 'DIFFUSE', 'ENVIRONMENT', 'EMIT', 'UV', 'SHADOW', 'COMBINED']
@@ -1195,6 +1267,17 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         ('NEG_Z', "-Z", ""),
     )
     
+    multires_subpasses = (
+        ('NORMALS', "Normals", "Bake Normals"),
+        ('DISPLACEMENT', "Displacement", "Bake Displacement"),
+    )
+    
+    multires_sampling = (
+        ('MAXIMUM', "Max to Min", "Bake the highest resolution down to the lowest"),
+        ('FROMMOD', "Modifier Values", "Bake from the current render resolution to the current preview resolution"),
+        ('CUSTOM', "Custom Values", "Choose custom values for the target and source resolutions"),
+    )
+    
     cycles_devices = (
         ('CPU', "CPU", "Use CPU for baking"),
         ('GPU', "GPU", "Use GPU for baking"),
@@ -1204,7 +1287,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     bake_samples: bpy.props.IntProperty(name="Bake Samples", description="Number of samples to bake for each pixel. Use 25 to 50 samples for most bake types (AO may look better with more).\nQuality is gained by increaseing resolution rather than samples past that point", default=32, min=1)
     bake_xres: bpy.props.IntProperty(name="Bake X resolution", description="Number of horizontal pixels in bake. Power of 2 image sizes are recommended for exporting", default=1024, min=1, subtype='PIXEL')
     bake_yres: bpy.props.IntProperty(name="Bake Y resolution", description="Number of vertical pixels in bake. Power of 2 image sizes are recommended for exporting", default=1024, min=1, subtype='PIXEL')
-    mask_samples: bpy.props.IntProperty(name="Mask Samples", description="Number of samples to bake for each pixel in the mask. This can be a low value.\nSetting to 0 will disable masking, which is much faster but will completely overwrite the output image", default=0, min=0)
+    use_mask: bpy.props.BoolProperty(name="Use Masking", description="Generate a map of changed UV islands to use as a mask when updating pixel values. Allows layering of multiple passes onto a single image so long as they don't overlap", default=False)
     norm_space: bpy.props.EnumProperty(name="Space", description="Space to bake the normals in", items=normal_spaces, default='TANGENT')
     norm_R: bpy.props.EnumProperty(name="R", description="Axis to bake in Red channel", items=normal_swizzle, default='POS_X')
     norm_G: bpy.props.EnumProperty(name="G", description="Axis to bake in Green channel", items=normal_swizzle, default='POS_Y')
@@ -1219,15 +1302,19 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
     use_subsurface: bpy.props.BoolProperty(name="Subsurface", description="Add subsurface contribution", default=True)
     use_ao: bpy.props.BoolProperty(name="Ambient Occlusion", description="Add ambient occlusion contribution", default=True)
     use_emit: bpy.props.BoolProperty(name="Emit", description="Add emission contribution", default=True)
-    curve_px: bpy.props.IntProperty(name="Curve Pixel Width", description="Curvature edge pixel width", default=1)
+    curve_val: bpy.props.FloatProperty(name="Curvature Width", description="Controls the relative thickness (UV space) a curve takes up", default=1.0, min=0.1, max=2.0, step=1)
     use_world: bpy.props.BoolProperty(name="Use World", description="Enabled to pick a world to use (empty to use active), instead of Bake Wranglers default", default=False)
     the_world: bpy.props.PointerProperty(name="World", description="World to use instead of Bake Wranglers default (empty to use active)", type=bpy.types.World)
     cpy_render: bpy.props.BoolProperty(name="Copy Settings", description="Copy render settings from selected scene (empty to use active), instead of using defaults", default=False)
     cpy_from: bpy.props.PointerProperty(name="Render Scene", description="Scene to copy render settings from (empty to use active)", type=bpy.types.Scene)
-    cavity_samp: bpy.props.IntProperty(name="Cavity Over Samples", description="Number of cavity samples per point (more gives a bettre result but takes longer)", default=16)
-    cavity_dist: bpy.props.FloatProperty(name="Cavity Sample Distance", description="How far away a face can be to contribute to the cavity calcuation (may need larger distances for larger objects)", default=0.4, step=1, min=0.0, unit='LENGTH')
-    cavity_gamma: bpy.props.FloatProperty(name="Cavity Gamma", description="Gamma transform to be performed on cavity values", default=2.2, step=1)
-    use_float: bpy.props.BoolProperty(name="Use Float Buffer", description="Enabled 32 bit float buffer for bake. When using this for baking data, color space should be set to Non-Color or you may get odd results", default=False)
+    cavity_samp: bpy.props.IntProperty(name="Cavity Over Samples", description="Number of cavity samples per point (more gives a better result but takes longer)", default=16)
+    cavity_dist: bpy.props.FloatProperty(name="Cavity Sample Distance", description="How far away a face can be to contribute to the cavity calculation (may need larger distances for larger objects)", default=0.4, step=1, min=0.0, unit='LENGTH')
+    cavity_gamma: bpy.props.FloatProperty(name="Cavity Gamma", description="Gamma transform to be performed on cavity values", default=1.0, step=1)
+    multi_pass: bpy.props.EnumProperty(name="Multires Type", description="Type of multiresolution pass to bake", items=multires_subpasses, default='NORMALS')
+    multi_samp: bpy.props.EnumProperty(name="Multires Method", description="Method to pick multiresolution source and target", items=multires_sampling, default='MAXIMUM')
+    multi_targ: bpy.props.IntProperty(name="Multires Target", description="Subdivision level for target of bake", default=0, min=0, soft_max=16)
+    multi_sorc: bpy.props.IntProperty(name="Multires Source", description="Subdivision level for source of bake", default=8, min=0, soft_max=16)
+    adv_settings: bpy.props.BoolProperty(name="Advanced Settings", description="Show or hide advanced settings", default=False)
     
     def init(self, context):
         # Set label to pass
@@ -1242,72 +1329,121 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
         self.outputs.new('BakeWrangler_Socket_Float', "G")
         self.outputs.new('BakeWrangler_Socket_Float', "B")
         self.outputs.new('BakeWrangler_Socket_Float', "Value")
+        # Prefs
+        self.bake_samples = _prefs("def_samples")
+        self.bake_xres = _prefs("def_xres")
+        self.bake_yres = _prefs("def_yres")
+        self.bake_device = self.cycles_devices[int(_prefs("def_device"))][0]
+        self.adv_settings = _prefs("def_show_adv")
 
     def draw_buttons(self, context, layout):
         BakeWrangler_Tree_Node.draw_bake_button(self, layout, 'RENDER_STILL', "Bake Pass")
-        layout.prop(self, "bake_pass")
-        if self.bake_pass == 'NORMAL':
-            split = layout.split(factor=0.5)
-            col = split.column(align=True)
-            col.alignment = 'RIGHT'
-            col.label(text="Space:")
-            col.label(text="R:")
-            col.label(text="G:")
-            col.label(text="B:")
-            col = split.column(align=True)
-            col.prop(self, "norm_space", text="")
-            col.prop(self, "norm_R", text="")
-            col.prop(self, "norm_G", text="")
-            col.prop(self, "norm_B", text="")
-        elif self.bake_pass == 'CURVATURE':
-            split = layout.split(factor=0.5)
-            split.label(text="Px Width:")
-            split.prop(self, "curve_px", text="")
-        elif self.bake_pass == 'CAVITY':
-            col = layout.column(align=True)
-            col.prop(self, "cavity_samp", text="Over Samples")
-            col.prop(self, "cavity_dist", text="Distance")
-            col.prop(self, "cavity_gamma", text="Gamma")
-        elif self.bake_pass in self.bake_has_influence:
-            row = layout.row(align=True)
-            row.use_property_split = False
-            row.prop(self, "use_direct", toggle=True)
-            row.prop(self, "use_indirect", toggle=True)
-            if self.bake_pass != 'COMBINED':
-                row.prop(self, "use_color", toggle=True)
-            else:
-                col = layout.column(align=True)
-                col.prop(self, "use_diffuse")
-                col.prop(self, "use_glossy")
-                col.prop(self, "use_transmission")
-                col.prop(self, "use_subsurface")
-                col.prop(self, "use_ao")
-                col.prop(self, "use_emit")
-        split = layout.split()
-        split.label(text="Device:")
-        split.prop(self, "bake_device", text="")
-        split = layout.split()
+        colnode = layout.column(align=False)
+        
+        colpass = colnode.column(align=True)
+        colpass.prop(self, "bake_pass")
+        
+        colbake = colnode.column(align=True)
+        split = colbake.split(factor=0.4)
         split.label(text="Samples:")
         split.prop(self, "bake_samples", text="")
-        split = layout.split()
-        split.label(text="Mask:")
-        split.prop(self, "mask_samples", text="")
-        split = layout.split(factor=0.15)
-        split.label(text="X:")
-        split.prop(self, "bake_xres", text="")
-        split = layout.split(factor=0.15)
-        split.label(text="Y:")
-        split.prop(self, "bake_yres", text="")
-        row = layout.row(align=True)
-        row.prop(self, "use_float", text="Use 32 Bit Float")
-        row = layout.row(align=True)
-        row.prop(self, "use_world", text="Use My World", toggle=True)
-        if self.use_world:
-            row.prop_search(self, "the_world", bpy.data, "worlds", text="")
-        row = layout.row(align=True)
-        row.prop(self, "cpy_render", text="Use My Settings", toggle=True)
-        if self.cpy_render:
-            row.prop_search(self, "cpy_from", bpy.data, "scenes", text="")
+        
+        colres = colnode.column(align=True)
+        colres.prop(self, "bake_xres", text="X")
+        colres.prop(self, "bake_yres", text="Y")
+        
+        advrow = colnode.row()
+        advrow.alignment = 'LEFT'
+        
+        if not self.adv_settings:
+            advrow.prop(self, "adv_settings", icon="DISCLOSURE_TRI_RIGHT", emboss=False, text="Advanced Settings:")
+            advrow.separator()
+        else:
+            advrow.prop(self, "adv_settings", icon="DISCLOSURE_TRI_DOWN", emboss=False, text="Advanced Settings:")
+            advrow.separator()
+            
+            split = colnode.split(factor=0.4)
+            split.label(text="Device:")
+            split.prop(self, "bake_device", text="")
+            
+            colnode.prop(self, "use_mask")
+            
+            row = colnode.row(align=True)
+            row.prop(self, "use_world", text="Use My World", toggle=True)
+            if self.use_world:
+                row.prop_search(self, "the_world", bpy.data, "worlds", text="")
+                
+            row = colnode.row(align=True)
+            row.prop(self, "cpy_render", text="Use My Settings", toggle=True)
+            if self.cpy_render:
+                row.prop_search(self, "cpy_from", bpy.data, "scenes", text="")
+            
+            rowpassopt = colnode.row()
+            rowpassopt.alignment = 'RIGHT'
+            splitopt = colnode.split(factor=0.5)
+            colopttxt = splitopt.column(align=True)
+            colopttxt.alignment = 'RIGHT'
+            coloptval = splitopt.column(align=True)
+            
+            if self.bake_pass == 'NORMAL':
+                rowpassopt.label(text="Normal Options:")
+                
+                colopttxt.label(text="Space:")
+                colopttxt.label(text="R:")
+                colopttxt.label(text="G:")
+                colopttxt.label(text="B:")
+                
+                coloptval.prop(self, "norm_space", text="")
+                coloptval.prop(self, "norm_R", text="")
+                coloptval.prop(self, "norm_G", text="")
+                coloptval.prop(self, "norm_B", text="")
+            elif self.bake_pass == 'MULTIRES':
+                rowpassopt.label(text="Multires Options:")
+                
+                colopttxt.label(text="Type:")
+                colopttxt.label(text="Method:")
+                
+                coloptval.prop(self, "multi_pass", text="")
+                coloptval.prop(self, "multi_samp", text="")
+                if self.multi_samp == 'CUSTOM':
+                    colopttxt.label(text="Target Divs:")
+                    colopttxt.label(text="Source Divs:")
+                    
+                    coloptval.prop(self, "multi_targ", text="")
+                    coloptval.prop(self, "multi_sorc", text="")
+            elif self.bake_pass == 'CURVATURE':
+                rowpassopt.label(text="Curvature Options:")
+                
+                colopttxt.label(text="Width:")
+                
+                coloptval.prop(self, "curve_val", text="")
+            elif self.bake_pass == 'CAVITY':
+                rowpassopt.label(text="Cavity Options:")
+                
+                colopttxt.label(text="Over Samples:")
+                colopttxt.label(text="Distance:")
+                colopttxt.label(text="Gamma:")
+                
+                coloptval.prop(self, "cavity_samp", text="")
+                coloptval.prop(self, "cavity_dist", text="")
+                coloptval.prop(self, "cavity_gamma", text="")
+            elif self.bake_pass in self.bake_has_influence:
+                rowpassopt.label(text="Influence Options:")
+                
+                row = colnode.row(align=True)
+                row.use_property_split = False
+                row.prop(self, "use_direct", toggle=True)
+                row.prop(self, "use_indirect", toggle=True)
+                if self.bake_pass != 'COMBINED':
+                    row.prop(self, "use_color", toggle=True)
+                else:
+                    col = colnode.column(align=True)
+                    col.prop(self, "use_diffuse")
+                    col.prop(self, "use_glossy")
+                    col.prop(self, "use_transmission")
+                    #col.prop(self, "use_subsurface")
+                    col.prop(self, "use_ao")
+                    col.prop(self, "use_emit")
 
 # Output node that specifies the path to a file where a bake should be saved along with size and format information.
 # Takes input from the outputs of a bake pass node. Connecting multiple inputs will cause higher position inputs to
@@ -1316,7 +1452,7 @@ class BakeWrangler_Bake_Pass(Node, BakeWrangler_Tree_Node):
 class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     '''Output image path node'''
     bl_label = 'Output Image Path'
-    bl_width_default = 157
+    bl_width_default = 160
     
     # Returns the most identifying string for the node
     def get_name(self):
@@ -1334,12 +1470,12 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
         # Validate inputs
         has_valid_input = False
         for input in self.inputs:
-            if input.is_linked and input.valid:
+            if input.islinked() and input.valid:
                 if not is_primary:
                     has_valid_input = True
                     break
                 else:
-                    input_valid = input.links[0].from_node.validate()
+                    input_valid = follow_input_link(input.links[0]).from_node.validate()
                     valid[0] = input_valid.pop(0)
                     if valid[0]:
                         has_valid_input = True
@@ -1350,8 +1486,18 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
             valid.append([_print("Input error", node=self, ret=True), ": No valid inputs connected"])
         # Validate file path
         if not os.path.isdir(os.path.abspath(self.img_path)):
-            valid[0] = False
-            valid.append([_print("Path error", node=self, ret=True), ": Invalid path '%s'" % (os.path.abspath(self.img_path))])
+            # Try creating the path if enabled in prefs
+            if _prefs("make_dirs") and not os.path.exists(os.path.abspath(self.img_path)):
+                try:
+                    os.makedirs(os.path.abspath(self.img_path))
+                except OSError as err:
+                    valid[0] = False
+                    valid.append([_print("Path error", node=self, ret=True), ": Trying to create path at '%s'" % (err.strerror)])
+                    return valid
+            else:
+                valid[0] = False
+                valid.append([_print("Path error", node=self, ret=True), ": Invalid path '%s'" % (os.path.abspath(self.img_path))])
+                return valid
         # Check if there is read/write access to the file/directory
         file_path = os.path.join(os.path.abspath(self.img_path), self.name_with_ext())
         if os.path.exists(file_path):
@@ -1519,6 +1665,8 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     
     # Properties that are part of the ImageFormatSettings data, recreated here because that data block isn't usable by mods
     # Color Modes
+    img_clear: bpy.props.BoolProperty(name="Clear Image", description="Clear image before writing bake data", default=False)
+    img_use_float: bpy.props.BoolProperty(name="Use 32 Bit Float", description="Generate all input passes using 32 bit floating point color (128 bits per pixel). Note this isn't very useful if your image format isn't set to a high bit depth", default=False)
     img_color_mode: bpy.props.EnumProperty(name="Color", description="Choose BW for saving grayscale images, RGB for saving red, green and blue channels, and RGBA for saving red, green, blue and alpha channels", items=img_color_modes, default='RGB')
     img_color_mode_noalpha: bpy.props.EnumProperty(name="Color", description="Choose BW for saving grayscale images, RGB for saving red, green and blue channels", items=img_color_modes_noalpha, default='RGB')
     
@@ -1544,111 +1692,122 @@ class BakeWrangler_Output_Image_Path(Node, BakeWrangler_Tree_Node):
     img_dpx_log: bpy.props.BoolProperty(name="Log", description="Convert to logarithmic color space", default=False)
     img_openexr_zbuff: bpy.props.BoolProperty(name="Z Buffer", description="Save the z-depth per pixel (32 bit unsigned int z-buffer)", default=True)
     
+    # Core settings
     img_color_space: bpy.props.EnumProperty(name="Color Space", description="Color space to use when saving the image", items=img_color_spaces, default='sRGB')
-    #image: bpy.props.PointerProperty(type=bpy.types.Image)
     disp_path: bpy.props.StringProperty(name="Output Path", description="Path to save image in", default="", subtype='DIR_PATH', update=get_full_path)
     img_path: bpy.props.StringProperty(name="Output Path", description="Path to save image in", default="", subtype='DIR_PATH')
     img_name: bpy.props.StringProperty(name="Output File", description="File to save image in", default="Image", subtype='FILE_NAME')
     img_type: bpy.props.EnumProperty(name="Image Format", description="File format to save bake as", items=img_format, default='PNG')
     img_xres: bpy.props.IntProperty(name="Image X resolution", description="Number of horizontal pixels in image. Bake pass data will be scaled to fit the image size. Power of 2 sizes are usually best for exporting", default=2048, min=1, subtype='PIXEL')
     img_yres: bpy.props.IntProperty(name="Image Y resolution", description="Number of vertical pixels in image. Bake pass data will be scaled to fit the image size. Power of 2 sizes are usually best for exporting", default=2048, min=1, subtype='PIXEL')
-
+    adv_settings: bpy.props.BoolProperty(name="Advanced Settings", description="Display or hide advanced settings", default=False)
+    
     def init(self, context):
         # Sockets IN
         self.inputs.new('BakeWrangler_Socket_Color', "Color")
-        self.inputs.new('BakeWrangler_Socket_Float', "Alpha")
         self.inputs.new('BakeWrangler_Socket_Float', "R")
         self.inputs.new('BakeWrangler_Socket_Float', "G")
         self.inputs.new('BakeWrangler_Socket_Float', "B")
+        self.inputs.new('BakeWrangler_Socket_Float', "A")
         # Sockets OUT
         self.outputs.new('BakeWrangler_Socket_Bake', "Bake")
+        # Prefs
+        self.img_type = self.img_format[_prefs("def_format")][0]
+        self.img_xres = _prefs("def_xout")
+        self.img_yres = _prefs("def_yout")
+        self.disp_path = _prefs("def_outpath")
+        self.img_name = _prefs("def_outname")
+        self.adv_settings = _prefs("def_show_adv")
         
-        # Set initial output format to what ever is currently selected in the render settings (if it's in the list)
-        for type, name, desc in self.img_format:
-            if bpy.context.scene.render.image_settings.file_format == type:
-                self.img_type = type
-
     def draw_buttons(self, context, layout):
         BakeWrangler_Tree_Node.draw_bake_button(self, layout, 'IMAGE', "Bake Image")
-        layout.label(text="Image Path:")
-        layout.prop(self, "disp_path", text="")
-        layout.prop(self, "img_name", text="")
-        split = layout.split(factor=0.4)
+        colnode = layout.column(align=False)
+        
+        split = colnode.split(factor=0.35)
         split.label(text="Format:")
         split.prop(self, "img_type", text="")
-        split = layout.split(factor=0.2)
-        split.label(text="X:")
-        split.prop(self, "img_xres", text="")
-        split = layout.split(factor=0.2)
-        split.label(text="Y:")
-        split.prop(self, "img_yres", text="")
-        # Color Spaces
-        if self.img_type != 'CINEON':
-            split = layout.split(factor=0.4)
-            split.label(text="Space:")
-            split.prop(self, "img_color_space", text="")
-        # Color Modes
-        if self.img_type in ['BMP', 'JPEG', 'CINEON', 'HDR']:
-            split = layout.split(factor=0.4)
-            split.label(text="Color:")
-            split.prop(self, "img_color_mode_noalpha", text="")
-        if self.img_type in ['IRIS', 'PNG', 'JPEG2000', 'TARGA', 'TARGA_RAW', 'DPX', 'OPEN_EXR_MULTILAYER', 'OPEN_EXR', 'TIFF']:
-            split = layout.split(factor=0.4)
-            split.label(text="Color:")
-            split.prop(self, "img_color_mode", text="")
-        # Color Depths
-        if self.img_type in ['PNG', 'TIFF']:
-            split = layout.split(factor=0.4)
-            split.label(text="Depth:")
-            split.prop(self, "img_color_depth_8_16", text="")
-        if self.img_type == 'JPEG2000':
-            split = layout.split(factor=0.4)
-            split.label(text="Depth:")
-            split.prop(self, "img_color_depth_8_12_16", text="")
-        if self.img_type == 'DPX':
-            split = layout.split(factor=0.4)
-            split.label(text="Depth:")
-            split.prop(self, "img_color_depth_8_10_12_16", text="")
-        if self.img_type in ['OPEN_EXR_MULTILAYER', 'OPEN_EXR']:
-            split = layout.split(factor=0.4)
-            split.label(text="Depth:")
-            split.prop(self, "img_color_depth_16_32", text="")
-        # Compression / Quality
-        if self.img_type == 'PNG':
-            split = layout.split(factor=0.4)
-            split.label(text="Compression:")
-            split.prop(self, "img_compression", text="")
-        if self.img_type in ['JPEG', 'JPEG2000']:
-            split = layout.split(factor=0.4)
-            split.label(text="Quality:")
-            split.prop(self, "img_quality", text="")
-        # Codecs
-        if self.img_type == 'JPEG2000':
-            split = layout.split(factor=0.4)
-            split.label(text="Codec:")
-            split.prop(self, "img_codec_jpeg2k", text="")
-        if self.img_type in ['OPEN_EXR', 'OPEN_EXR_MULTILAYER']:
-            split = layout.split(factor=0.4)
-            split.label(text="Codec:")
-            split.prop(self, "img_codec_openexr", text="")
-        if self.img_type == 'TIFF':
-            split = layout.split(factor=0.4)
-            split.label(text="Compression:")
-            split.prop(self, "img_codec_tiff", text="")
-        # Other random image settings
-        if self.img_type == 'JPEG2000':
-            layout.prop(self, "img_jpeg2k_cinema")
-            layout.prop(self, "img_jpeg2k_cinema48")
-            layout.prop(self, "img_jpeg2k_ycc")
-        if self.img_type == 'DPX':
-            layout.prop(self, "img_dpx_log")
-        if self.img_type == 'OPEN_EXR':
-            layout.prop(self, "img_openexr_zbuff")
+        
+        colpath = colnode.column(align=True)
+        colpath.prop(self, "disp_path", text="")
+        colpath.prop(self, "img_name", text="")
+        
+        colres = colnode.column(align=True)
+        colres.prop(self, "img_xres", text="X")
+        colres.prop(self, "img_yres", text="Y")
+        
+        advrow = colnode.row()
+        advrow.alignment = 'LEFT'
+        
+        if not self.adv_settings:
+            advrow.prop(self, "adv_settings", icon="DISCLOSURE_TRI_RIGHT", emboss=False, text="Advanced Settings:")
+            advrow.separator()
+        else:
+            advrow.prop(self, "adv_settings", icon="DISCLOSURE_TRI_DOWN", emboss=False, text="Advanced Settings:")
+            advrow.separator()
+            
+            coladv = colnode.column(align=True)
+            coladv.prop(self, "img_clear")
+            coladv.prop(self, "img_use_float")
+            
+            splitadv = coladv.split(factor=0.4)
+            coladvtxt = splitadv.column(align=True)
+            coladvopt = splitadv.column(align=True)
+            
+            # Color Spaces
+            if self.img_type != 'CINEON':
+                coladvtxt.label(text="Space:")
+                coladvopt.prop(self, "img_color_space", text="")
+            # Color Modes
+            if self.img_type in ['BMP', 'JPEG', 'CINEON', 'HDR']:
+                coladvtxt.label(text="Color:")
+                coladvopt.prop(self, "img_color_mode_noalpha", text="")
+            if self.img_type in ['IRIS', 'PNG', 'JPEG2000', 'TARGA', 'TARGA_RAW', 'DPX', 'OPEN_EXR_MULTILAYER', 'OPEN_EXR', 'TIFF']:
+                coladvtxt.label(text="Color:")
+                coladvopt.prop(self, "img_color_mode", text="")
+            # Color Depths
+            if self.img_type in ['PNG', 'TIFF']:
+                coladvtxt.label(text="Depth:")
+                coladvopt.prop(self, "img_color_depth_8_16", text="")
+            if self.img_type == 'JPEG2000':
+                coladvtxt.label(text="Depth:")
+                coladvopt.prop(self, "img_color_depth_8_12_16", text="")
+            if self.img_type == 'DPX':
+                coladvtxt.label(text="Depth:")
+                coladvopt.prop(self, "img_color_depth_8_10_12_16", text="")
+            if self.img_type in ['OPEN_EXR_MULTILAYER', 'OPEN_EXR']:
+                coladvtxt.label(text="Depth:")
+                coladvopt.prop(self, "img_color_depth_16_32", text="")
+            # Compression / Quality
+            if self.img_type == 'PNG':
+                coladvtxt.label(text="Compression:")
+                coladvopt.prop(self, "img_compression", text="")
+            if self.img_type in ['JPEG', 'JPEG2000']:
+                coladvtxt.label(text="Quality:")
+                coladvopt.prop(self, "img_quality", text="")
+            # Codecs
+            if self.img_type == 'JPEG2000':
+                coladvtxt.label(text="Codec:")
+                coladvopt.prop(self, "img_codec_jpeg2k", text="")
+            if self.img_type in ['OPEN_EXR', 'OPEN_EXR_MULTILAYER']:
+                coladvtxt.label(text="Codec:")
+                coladvopt.prop(self, "img_codec_openexr", text="")
+            if self.img_type == 'TIFF':
+                coladvtxt.label(text="Compression:")
+                coladvopt.prop(self, "img_codec_tiff", text="")
+            # Other random image settings
+            if self.img_type == 'JPEG2000':
+                coladv.prop(self, "img_jpeg2k_cinema")
+                coladv.prop(self, "img_jpeg2k_cinema48")
+                coladv.prop(self, "img_jpeg2k_ycc")
+            if self.img_type == 'DPX':
+                coladv.prop(self, "img_dpx_log")
+            if self.img_type == 'OPEN_EXR':
+                coladv.prop(self, "img_openexr_zbuff")
           
     # Validate incoming links
     def insert_link(self, link):
         if link.to_node == self:
-            if link.from_node.bl_idname == 'BakeWrangler_Bake_Pass':
+            if follow_input_link(link).from_node.bl_idname == 'BakeWrangler_Bake_Pass':
                 link.to_socket.valid = True
             else:
                 link.to_socket.valid = False
@@ -1671,13 +1830,13 @@ class BakeWrangler_Output_Batch_Bake(Node, BakeWrangler_Tree_Node):
         img_node_list = []
         pass_node_list = []
         for input in self.inputs:
-            if input.is_linked and input.links[0].is_valid and input.valid:
-                img_node = input.links[0].from_node
+            if input.islinked() and input.valid:
+                img_node = follow_input_link(input.links[0]).from_node
                 if not img_node_list.count(img_node):
                     img_node_list.append(img_node)
                     for img_node_input in img_node.inputs:
-                        if img_node_input.is_linked and img_node_input.links[0].is_valid and img_node_input.valid:
-                            pass_node = img_node_input.links[0].from_node
+                        if img_node_input.islinked() and img_node_input.valid:
+                            pass_node = follow_input_link(img_node_input.links[0]).from_node
                             if not pass_node_list.count(pass_node):
                                 pass_node_list.append(pass_node)
         # Validate all the listed nodes
@@ -1769,14 +1928,16 @@ def BakeWranger_Hook_Post_NewTree(dummy):
     debug = _prefs('debug')
     ctx = bpy.context
     if ctx.area and ctx.area.ui_type == 'BakeWrangler_Tree':
-        if debug: _print("Starting post depsgraph update")
-        if len(ctx.area.spaces) > 0:
-            space = None
-            for spc in ctx.area.spaces:
-                if spc.type == 'NODE_EDITOR' and hasattr(spc, 'node_tree'):
-                    space = spc
-                    break
-        if space:
+        # Context may actually not be the active area if multiple BakeWrangler areas are open, so check for more
+        spaces = []
+        for area in ctx.screen.areas:
+            if area.ui_type == 'BakeWrangler_Tree':
+                if len(area.spaces) > 0:
+                    for spc in area.spaces:
+                        if spc.type == 'NODE_EDITOR' and hasattr(spc, 'node_tree'):
+                            spaces.append(spc)
+                            break
+        for space in spaces:
             tree = space.node_tree
             # Init a new tree
             if tree and not tree.initialised:
@@ -1914,6 +2075,16 @@ def BakeWranger_Hook_Post_NewTree(dummy):
                                         break
                     # Fix version number
                     tree.tree_version = 3
+                # Update from v3 to v4
+                if tree.tree_version == 3:
+                    # Alpha channel on image output is moved to last input slot and renamed to "A"
+                    for node in list(tree.nodes):
+                        id = BakeWranger_Hook_RNA_Repair(node)
+                        if id == 'BakeWrangler_Output_Image_Path':
+                            node.inputs.move(1, 4) # Move second input (Alpha) to the 5th position
+                            node.inputs[4].name = "A" # Change it's name to "A" which also changes its array key
+                    # Change version number
+                    tree.tree_version = 4
                                         
 
 
@@ -1933,16 +2104,18 @@ def register():
         register_class(cls)
 
     nodeitems_utils.register_node_categories('BakeWrangler_Nodes', BakeWrangler_Node_Categories)
-    
-    post_hook_index = len(bpy.app.handlers.depsgraph_update_post)
     bpy.app.handlers.depsgraph_update_post.append(BakeWranger_Hook_Post_NewTree)
-
+    global post_hook_fn
+    post_hook_fn = bpy.app.handlers.depsgraph_update_post[-1]
 
 
 def unregister():
-    # Probably shouldn't try to do this...
-    if post_hook_index <= (len(bpy.app.handlers.depsgraph_update_post) + 1):
-        bpy.app.handlers.depsgraph_update_post.pop(post_hook_index)
+    hook_index = None
+    for idx in range(len(bpy.app.handlers.depsgraph_update_post)):
+        if bpy.app.handlers.depsgraph_update_post[idx] == post_hook_fn:
+            hook_index = idx
+    if hook_index != None:
+        bpy.app.handlers.depsgraph_update_post.pop(hook_index)
         
     nodeitems_utils.unregister_node_categories('BakeWrangler_Nodes')
 
